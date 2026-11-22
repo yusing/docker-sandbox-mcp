@@ -30,7 +30,7 @@ A Cloud Run-ready [Model Context Protocol (MCP)](https://modelcontextprotocol.io
 
 ## Local Development
 
-Requires **Node.js 20+** and a Docker account with an active [Docker Agentic Platform](https://docs.docker.com/ai/sandboxes-api/) subscription.
+Requires **Node.js 26 LTS** (or newer) and a Docker account with an active [Docker Agentic Platform](https://docs.docker.com/ai/sandboxes-api/) subscription.
 
 ```bash
 cp .env.example .env

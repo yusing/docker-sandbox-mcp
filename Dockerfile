@@ -1,4 +1,4 @@
-FROM node:22-slim AS builder
+FROM node:26-slim AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
@@ -8,7 +8,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-FROM node:22-slim AS runner
+FROM node:26-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=8080
