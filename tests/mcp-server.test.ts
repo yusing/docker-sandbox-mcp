@@ -3,10 +3,11 @@ import net from 'node:net';
 import { describe, it } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { createSandboxMcpServer } from '../src/mcp-server.js';
+import { createSandboxMcpServer, formatFileLines } from '../src/mcp-server.js';
 import {
   DEFAULT_WORKSPACE,
   createDockerAuthenticator,
+  matchesGlob,
   resolveCommandArgs,
   resolveSandboxPath,
   type ApplyAndRunInput,
@@ -15,11 +16,16 @@ import {
   type CreateSandboxInput,
   type FileEntry,
   type FileWriteInput,
+  type GlobFilesInput,
+  type GlobFilesResult,
+  type ListFilesOptions,
   type ProcessOutputResult,
   type ProcessSummary,
   type RunCommandInput,
   type SandboxService,
   type SandboxSummary,
+  type SearchFilesInput,
+  type SearchFilesResult,
 } from '../src/sandbox-service.js';
 
 async function getFreePort(): Promise<number> {
@@ -149,17 +155,84 @@ class MockSandboxService implements SandboxService {
     return content;
   }
 
-  async listFiles(name: string, path: string): Promise<FileEntry[]> {
+  async listFiles(
+    name: string,
+    dirPath: string,
+    options: ListFilesOptions = {},
+  ): Promise<FileEntry[]> {
     await this.getSandbox(name);
     const store = this.files.get(name)!;
-    return Array.from(store.entries())
-      .filter(([p]) => p.startsWith(path))
-      .map(([p, content]) => ({
+    const prefix = dirPath.endsWith('/') ? dirPath : `${dirPath}/`;
+    const maxDepth = options.recursive ? (options.maxDepth ?? 3) : 1;
+    const maxEntries = options.maxEntries ?? 200;
+    const entries: FileEntry[] = [];
+    for (const [p, content] of store.entries()) {
+      if (!p.startsWith(prefix)) continue;
+      const rel = p.slice(prefix.length);
+      const depth = rel.split('/').length;
+      if (depth > maxDepth) continue;
+      entries.push({
         name: p.split('/').pop() ?? p,
         path: p,
         isDir: false,
         size: content.length,
-      }));
+      });
+      if (entries.length >= maxEntries) break;
+    }
+    return entries;
+  }
+
+  async globFiles(name: string, input: GlobFilesInput): Promise<GlobFilesResult> {
+    await this.getSandbox(name);
+    const basePath = resolveSandboxPath(input.path, this.workspace);
+    const prefix = basePath.endsWith('/') ? basePath : `${basePath}/`;
+    const maxResults = input.maxResults ?? 200;
+    const store = this.files.get(name)!;
+    const allMatches: string[] = [];
+    for (const filePath of store.keys()) {
+      if (!filePath.startsWith(prefix)) continue;
+      const rel = filePath.slice(prefix.length);
+      if (matchesGlob(rel, input.pattern)) {
+        allMatches.push(filePath);
+      }
+    }
+    return {
+      basePath,
+      matches: allMatches.slice(0, maxResults),
+      truncated: allMatches.length > maxResults,
+    };
+  }
+
+  async searchFiles(name: string, input: SearchFilesInput): Promise<SearchFilesResult> {
+    await this.getSandbox(name);
+    const basePath = resolveSandboxPath(input.path, this.workspace);
+    const prefix = basePath.endsWith('/') ? basePath : `${basePath}/`;
+    const maxResults = input.maxResults ?? 100;
+    const store = this.files.get(name)!;
+    const flags = input.caseSensitive === false ? 'i' : '';
+    const regex = input.fixedStrings
+      ? new RegExp(input.pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags)
+      : new RegExp(input.pattern, flags);
+
+    const matches: SearchFilesResult['matches'] = [];
+    let truncated = false;
+    for (const [filePath, content] of store.entries()) {
+      if (!filePath.startsWith(prefix)) continue;
+      const rel = filePath.slice(prefix.length);
+      if (input.glob && !matchesGlob(rel, input.glob)) continue;
+      const lines = content.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i += 1) {
+        if (regex.test(lines[i])) {
+          if (matches.length >= maxResults) {
+            truncated = true;
+            break;
+          }
+          matches.push({ path: filePath, line: i + 1, text: lines[i] });
+        }
+      }
+      if (truncated) break;
+    }
+    return { basePath, matches, truncated };
   }
 
   async applyAndRun(name: string, input: ApplyAndRunInput): Promise<ApplyAndRunResult> {
@@ -229,6 +302,8 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       assert.equal(toolMap.get('get_sandbox')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('read_file')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('list_files')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('glob_files')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('search_files')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('get_process_output')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('apply_and_run')?.annotations?.readOnlyHint, false);
       assert.equal(toolMap.get('delete_sandbox')?.annotations?.destructiveHint, true);
@@ -248,7 +323,7 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
         arguments: {
           sandboxName: created.name,
           cwd: 'app',
-          files: [{ path: 'hello.txt', content: 'hello world' }],
+          files: [{ path: 'hello.txt', content: 'line1\nhello world\nline3\n' }],
           args: ['sh', '-c', 'cat hello.txt'],
         },
       });
@@ -261,18 +336,47 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
 
       const readRes = await client.callTool({
         name: 'read_file',
-        arguments: { sandboxName: created.name, path: 'app/hello.txt' },
+        arguments: {
+          sandboxName: created.name,
+          path: 'app/hello.txt',
+          startLine: 2,
+          endLine: 2,
+        },
       });
-      assert.equal((readRes.content as Array<{ text: string }>)[0].text, 'hello world');
+      assert.equal(
+        (readRes.content as Array<{ text: string }>)[0].text,
+        '2\thello world\n\n[Showing lines 2-2 of 3]',
+      );
 
       const listedFilesRes = await client.callTool({
         name: 'list_files',
-        arguments: { sandboxName: created.name },
+        arguments: { sandboxName: created.name, recursive: true, maxDepth: 3 },
       });
       const listedFiles = JSON.parse((listedFilesRes.content as Array<{ text: string }>)[0].text);
       assert.equal(listedFiles.path, '/workspace');
       assert.equal(listedFiles.entries.length, 1);
       assert.equal(listedFiles.entries[0].path, '/workspace/app/hello.txt');
+
+      const globRes = await client.callTool({
+        name: 'glob_files',
+        arguments: { sandboxName: created.name, pattern: '**/*.txt' },
+      });
+      const globbed = JSON.parse((globRes.content as Array<{ text: string }>)[0].text);
+      assert.deepEqual(globbed.matches, ['/workspace/app/hello.txt']);
+
+      const searchRes = await client.callTool({
+        name: 'search_files',
+        arguments: {
+          sandboxName: created.name,
+          pattern: 'HELLO',
+          caseSensitive: false,
+          glob: '*.txt',
+        },
+      });
+      const searched = JSON.parse((searchRes.content as Array<{ text: string }>)[0].text);
+      assert.deepEqual(searched.matches, [
+        { path: '/workspace/app/hello.txt', line: 2, text: 'hello world' },
+      ]);
 
       const runCmdRes = await client.callTool({
         name: 'run_command',
@@ -348,6 +452,20 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       /not both/,
     );
     assert.throws(() => resolveCommandArgs({ command: '   ' }), /must not be empty/);
+  });
+
+  it('formats line-ranged file content and matches glob patterns accurately', () => {
+    const sample = 'alpha\nbeta\ngamma\ndelta\n';
+    assert.equal(formatFileLines(sample), '1\talpha\n2\tbeta\n3\tgamma\n4\tdelta');
+    assert.equal(
+      formatFileLines(sample, { startLine: 2, endLine: 3, lineNumbers: false }),
+      'beta\ngamma\n\n[Showing lines 2-3 of 4]',
+    );
+    assert.throws(() => formatFileLines(sample, { startLine: 4, endLine: 2 }), /endLine/);
+
+    assert.equal(matchesGlob('src/mcp-server.ts', '**/*.ts'), true);
+    assert.equal(matchesGlob('src/mcp-server.ts', '*.ts'), true);
+    assert.equal(matchesGlob('src/mcp-server.ts', '**/*.{js,json}'), false);
   });
 
   it('throws clear error when Docker credentials are missing', () => {

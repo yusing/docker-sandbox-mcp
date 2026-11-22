@@ -64,6 +64,100 @@ export interface FileEntry {
   size?: number;
 }
 
+export interface ListFilesOptions {
+  recursive?: boolean;
+  maxDepth?: number;
+  maxEntries?: number;
+}
+
+export interface GlobFilesInput {
+  pattern: string;
+  path?: string;
+  maxResults?: number;
+}
+
+export interface GlobFilesResult {
+  basePath: string;
+  matches: string[];
+  truncated: boolean;
+}
+
+export interface SearchFilesInput {
+  pattern: string;
+  path?: string;
+  glob?: string;
+  caseSensitive?: boolean;
+  fixedStrings?: boolean;
+  maxResults?: number;
+}
+
+export interface SearchMatch {
+  path: string;
+  line: number;
+  text: string;
+}
+
+export interface SearchFilesResult {
+  basePath: string;
+  matches: SearchMatch[];
+  truncated: boolean;
+}
+
+export function globToRegExp(pattern: string): RegExp {
+  const normalized = pattern.replace(/^\.\//, '');
+  let regex = '^';
+  let i = 0;
+  while (i < normalized.length) {
+    const ch = normalized[i];
+    if (ch === '*') {
+      if (normalized[i + 1] === '*') {
+        if (normalized[i + 2] === '/') {
+          regex += '(?:.*/)?';
+          i += 3;
+          continue;
+        }
+        regex += '.*';
+        i += 2;
+        continue;
+      }
+      regex += '[^/]*';
+      i += 1;
+      continue;
+    }
+    if (ch === '?') {
+      regex += '[^/]';
+      i += 1;
+      continue;
+    }
+    if (ch === '{') {
+      const close = normalized.indexOf('}', i + 1);
+      if (close !== -1) {
+        const alts = normalized
+          .slice(i + 1, close)
+          .split(',')
+          .map((alt) => alt.replace(/[.+^$|()[\]\\]/g, '\\$&'));
+        regex += `(?:${alts.join('|')})`;
+        i = close + 1;
+        continue;
+      }
+    }
+    regex += ch.replace(/[.+^$|()[\]\\]/g, '\\$&');
+    i += 1;
+  }
+  regex += '$';
+  return new RegExp(regex);
+}
+
+export function matchesGlob(relativePath: string, pattern: string): boolean {
+  const clean = relativePath.replace(/^\.\//, '');
+  const re = globToRegExp(pattern);
+  if (re.test(clean)) return true;
+  if (!pattern.includes('/')) {
+    return re.test(path.posix.basename(clean));
+  }
+  return false;
+}
+
 export interface FileWriteInput {
   path: string;
   content: string;
@@ -128,7 +222,9 @@ export interface SandboxService {
   getProcessOutput(name: string, processName: string): Promise<ProcessOutputResult>;
   writeFiles(name: string, files: FileWriteInput[]): Promise<{ writtenFiles: string[] }>;
   readFile(name: string, path: string, maxBytes?: number): Promise<string>;
-  listFiles(name: string, path: string): Promise<FileEntry[]>;
+  listFiles(name: string, path: string, options?: ListFilesOptions): Promise<FileEntry[]>;
+  globFiles(name: string, input: GlobFilesInput): Promise<GlobFilesResult>;
+  searchFiles(name: string, input: SearchFilesInput): Promise<SearchFilesResult>;
   applyAndRun(name: string, input: ApplyAndRunInput): Promise<ApplyAndRunResult>;
   close(): Promise<void>;
 }
@@ -342,19 +438,149 @@ export class DockerSandboxService implements SandboxService {
     });
   }
 
-  async listFiles(name: string, dirPath: string): Promise<FileEntry[]> {
+  async listFiles(
+    name: string,
+    dirPath: string,
+    options: ListFilesOptions = {},
+  ): Promise<FileEntry[]> {
     const sandbox = await this.client.get(name);
     const resolvedDir = resolveSandboxPath(dirPath, this.workspace);
-    const page = await sandbox.files.list(resolvedDir);
-    return page.items.map((item) => {
-      const record = item as Record<string, unknown>;
-      return {
-        name: String(record.name ?? ''),
-        path: String(record.path ?? ''),
-        isDir: Boolean(record.isDir ?? record.type === 'directory'),
-        size: typeof record.size === 'number' ? record.size : undefined,
-      };
-    });
+    const maxEntries = options.maxEntries ?? 200;
+    const recursive = Boolean(options.recursive || (options.maxDepth && options.maxDepth > 1));
+    const maxDepth = recursive ? (options.maxDepth ?? 3) : 1;
+
+    const entries: FileEntry[] = [];
+    const visited = new Set<string>([resolvedDir]);
+    const queue: Array<{ dir: string; depth: number }> = [{ dir: resolvedDir, depth: 1 }];
+
+    while (queue.length > 0 && entries.length < maxEntries) {
+      const current = queue.shift()!;
+      for await (const item of sandbox.files.all(current.dir)) {
+        const record = item as Record<string, unknown>;
+        const rawPath = String(record.path ?? '');
+        const entryPath = rawPath ? resolveSandboxPath(rawPath, current.dir) : current.dir;
+        const entryName =
+          typeof record.name === 'string' && record.name
+            ? record.name
+            : path.posix.basename(entryPath);
+        const isDir = Boolean(record.isDir ?? record.type === 'directory');
+        const rawSize = record.size;
+        const size =
+          typeof rawSize === 'number'
+            ? rawSize
+            : typeof rawSize === 'string' && rawSize.trim() !== '' && !Number.isNaN(Number(rawSize))
+              ? Number(rawSize)
+              : undefined;
+
+        entries.push({ name: entryName, path: entryPath, isDir, size });
+        if (entries.length >= maxEntries) {
+          break;
+        }
+        if (isDir && current.depth < maxDepth && !visited.has(entryPath)) {
+          visited.add(entryPath);
+          queue.push({ dir: entryPath, depth: current.depth + 1 });
+        }
+      }
+    }
+
+    return entries;
+  }
+
+  async globFiles(name: string, input: GlobFilesInput): Promise<GlobFilesResult> {
+    const sandbox = await this.client.get(name);
+    const basePath = resolveSandboxPath(input.path, this.workspace);
+    const maxResults = input.maxResults ?? 200;
+
+    const script = [
+      'if command -v rg >/dev/null 2>&1; then',
+      '  rg --files --hidden --glob "!.git/**" --glob "!.git" -g "$1" .',
+      'else',
+      '  find . -not -path "*/.git/*" -not -path "*/.git" -not -path "*/node_modules/*" -type f -print',
+      'fi',
+    ].join('\n');
+
+    const res = await sandbox.processes.run(
+      {
+        args: ['sh', '-c', script, '_', input.pattern],
+        workingDir: basePath,
+      },
+      { timeoutMs: 30_000 },
+    );
+
+    if (res.exitCode > 1) {
+      throw new Error(res.stderr.trim() || `glob failed with exit code ${res.exitCode}`);
+    }
+
+    const rawLines = res.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^\.\//, ''))
+      .filter(Boolean);
+
+    const filtered = rawLines.filter((rel) => matchesGlob(rel, input.pattern));
+    const truncated = filtered.length > maxResults;
+    const matches = filtered.slice(0, maxResults).map((rel) => resolveSandboxPath(rel, basePath));
+
+    return { basePath, matches, truncated };
+  }
+
+  async searchFiles(name: string, input: SearchFilesInput): Promise<SearchFilesResult> {
+    const sandbox = await this.client.get(name);
+    const basePath = resolveSandboxPath(input.path, this.workspace);
+    const maxResults = input.maxResults ?? 100;
+    const caseSensitive = input.caseSensitive ?? true;
+    const fixedStrings = input.fixedStrings ?? false;
+
+    const rgFlags = ['-n', '--no-heading', '--color', 'never', '--hidden', '--glob', '!.git/**'];
+    if (!caseSensitive) rgFlags.push('-i');
+    if (fixedStrings) rgFlags.push('-F');
+    if (input.glob) rgFlags.push('-g', input.glob);
+
+    const grepFlags = ['-rnI', '--exclude-dir=.git', '--exclude-dir=node_modules'];
+    if (!caseSensitive) grepFlags.push('-i');
+    if (fixedStrings) grepFlags.push('-F');
+    else grepFlags.push('-E');
+    if (input.glob) grepFlags.push(`--include=${input.glob}`);
+
+    const script = [
+      'pattern="$1"',
+      'if command -v rg >/dev/null 2>&1; then',
+      `  rg ${rgFlags.map((f) => `'${f.replace(/'/g, "'\\''")}'`).join(' ')} -- "$pattern" .`,
+      'else',
+      `  grep ${grepFlags.map((f) => `'${f.replace(/'/g, "'\\''")}'`).join(' ')} -- "$pattern" .`,
+      'fi',
+    ].join('\n');
+
+    const res = await sandbox.processes.run(
+      {
+        args: ['sh', '-c', script, '_', input.pattern],
+        workingDir: basePath,
+      },
+      { timeoutMs: 30_000 },
+    );
+
+    if (res.exitCode > 1) {
+      throw new Error(res.stderr.trim() || `search_files failed with exit code ${res.exitCode}`);
+    }
+
+    const matches: SearchMatch[] = [];
+    let truncated = false;
+    for (const rawLine of res.stdout.split(/\r?\n/)) {
+      if (!rawLine) continue;
+      const match = /^(.+?):(\d+):(.*)$/.exec(rawLine);
+      if (!match) continue;
+      if (matches.length >= maxResults) {
+        truncated = true;
+        break;
+      }
+      const relPath = match[1].replace(/^\.\//, '');
+      matches.push({
+        path: resolveSandboxPath(relPath, basePath),
+        line: Number(match[2]),
+        text: match[3],
+      });
+    }
+
+    return { basePath, matches, truncated };
   }
 
   async applyAndRun(name: string, input: ApplyAndRunInput): Promise<ApplyAndRunResult> {

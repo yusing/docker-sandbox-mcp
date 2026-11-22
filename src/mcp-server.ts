@@ -21,6 +21,45 @@ const SERVER_INSTRUCTIONS =
   'and background processes. Prefer apply_and_run to write files and execute a command in a ' +
   'single step, and clean up or stop sandboxes when finished.';
 
+export interface FormatFileLinesOptions {
+  startLine?: number;
+  endLine?: number;
+  lineNumbers?: boolean;
+}
+
+export function formatFileLines(
+  content: string,
+  options: FormatFileLinesOptions = {},
+): string {
+  const { startLine, endLine, lineNumbers = true } = options;
+  if (startLine !== undefined && endLine !== undefined && endLine < startLine) {
+    throw new Error(`endLine (${endLine}) must be greater than or equal to startLine (${startLine}).`);
+  }
+
+  const normalized = content.endsWith('\n') ? content.slice(0, -1) : content;
+  const lines = normalized.length === 0 ? [] : normalized.split(/\r?\n/);
+  const totalLines = lines.length;
+
+  const start = startLine ?? 1;
+  const end = Math.min(endLine ?? totalLines, totalLines);
+
+  if (totalLines === 0 || start > totalLines) {
+    return totalLines === 0
+      ? ''
+      : `[No lines in range ${start}-${endLine ?? totalLines}; file has ${totalLines} lines]`;
+  }
+
+  const sliced = lines.slice(start - 1, end);
+  const body = lineNumbers
+    ? sliced.map((line, idx) => `${start + idx}\t${line}`).join('\n')
+    : sliced.join('\n');
+
+  if (start > 1 || end < totalLines) {
+    return `${body}\n\n[Showing lines ${start}-${end} of ${totalLines}]`;
+  }
+  return body;
+}
+
 function truncateOutput(text: string, limit = MAX_OUTPUT_CHARS): string {
   if (text.length <= limit) return text;
   const omitted = text.length - limit;
@@ -387,13 +426,29 @@ export function createSandboxMcpServer({
 
   server.addTool({
     name: 'read_file',
-    description: `Read a UTF-8 text file from a Docker Cloud Sandbox. Relative paths resolve against ${workspace}.`,
+    description: `Read a UTF-8 text file from a Docker Cloud Sandbox with optional line range and line numbers. Relative paths resolve against ${workspace}.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
       path: z
         .string()
         .min(1)
         .describe(`File path inside the sandbox (relative to ${workspace} or absolute).`),
+      startLine: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('1-based starting line number (inclusive).'),
+      endLine: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('1-based ending line number (inclusive).'),
+      lineNumbers: z
+        .boolean()
+        .default(true)
+        .describe('Prefix each line with its 1-based line number (default: true).'),
       maxBytes: z
         .number()
         .int()
@@ -408,12 +463,13 @@ export function createSandboxMcpServer({
       idempotentHint: true,
       openWorldHint: false,
     },
-    execute: async ({ sandboxName, path: filePath, maxBytes }) => {
+    execute: async ({ sandboxName, path: filePath, startLine, endLine, lineNumbers, maxBytes }) => {
       try {
         const resolvedPath = resolveSandboxPath(filePath, workspace);
         const content = await service.readFile(sandboxName, resolvedPath, maxBytes);
+        const formatted = formatFileLines(content, { startLine, endLine, lineNumbers });
         return {
-          content: [{ type: 'text', text: truncateOutput(content) }],
+          content: [{ type: 'text', text: truncateOutput(formatted) }],
         };
       } catch (err) {
         return errorText(err);
@@ -423,7 +479,7 @@ export function createSandboxMcpServer({
 
   server.addTool({
     name: 'list_files',
-    description: `List files and directories at a given path inside a Docker Cloud Sandbox. Defaults to ${workspace}.`,
+    description: `List files and directories at a given path inside a Docker Cloud Sandbox, with optional bounded recursion. Defaults to ${workspace}.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
       path: z
@@ -431,6 +487,24 @@ export function createSandboxMcpServer({
         .min(1)
         .default('.')
         .describe(`Directory path inside the sandbox (relative to ${workspace} or absolute; default: "." -> ${workspace}).`),
+      recursive: z
+        .boolean()
+        .default(false)
+        .describe('Recursively traverse subdirectories (default: false).'),
+      maxDepth: z
+        .number()
+        .int()
+        .positive()
+        .max(10)
+        .optional()
+        .describe('Maximum traversal depth when recursive is true (default: 3, max: 10).'),
+      maxEntries: z
+        .number()
+        .int()
+        .positive()
+        .max(1000)
+        .default(200)
+        .describe('Maximum number of entries to return (default: 200, max: 1000).'),
     }),
     annotations: {
       title: 'List Files',
@@ -438,11 +512,122 @@ export function createSandboxMcpServer({
       idempotentHint: true,
       openWorldHint: false,
     },
-    execute: async ({ sandboxName, path: dirPath }) => {
+    execute: async ({ sandboxName, path: dirPath, recursive, maxDepth, maxEntries }) => {
       try {
         const resolvedPath = resolveSandboxPath(dirPath, workspace);
-        const entries = await service.listFiles(sandboxName, resolvedPath);
+        const entries = await service.listFiles(sandboxName, resolvedPath, {
+          recursive,
+          maxDepth,
+          maxEntries,
+        });
         return jsonText({ path: resolvedPath, entries });
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'glob_files',
+    description: `Find files matching a glob pattern inside a Docker Cloud Sandbox (read-only). Defaults to ${workspace}.`,
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+      pattern: z
+        .string()
+        .min(1)
+        .describe('Glob pattern to match (e.g. "**/*.ts", "src/*.json", "*.test.{ts,js}").'),
+      path: z
+        .string()
+        .min(1)
+        .default('.')
+        .describe(`Base directory to search (relative to ${workspace} or absolute; default: "." -> ${workspace}).`),
+      maxResults: z
+        .number()
+        .int()
+        .positive()
+        .max(1000)
+        .default(200)
+        .describe('Maximum number of matching file paths to return (default: 200).'),
+    }),
+    annotations: {
+      title: 'Glob Files',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName, pattern, path: dirPath, maxResults }) => {
+      try {
+        const resolvedPath = resolveSandboxPath(dirPath, workspace);
+        const res = await service.globFiles(sandboxName, {
+          pattern,
+          path: resolvedPath,
+          maxResults,
+        });
+        return jsonText(res);
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'search_files',
+    description: `Search file contents by regex or fixed string inside a Docker Cloud Sandbox (read-only, uses rg with grep fallback). Defaults to ${workspace}.`,
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+      pattern: z.string().min(1).describe('Regular expression or literal string to search for.'),
+      path: z
+        .string()
+        .min(1)
+        .default('.')
+        .describe(`Directory to search (relative to ${workspace} or absolute; default: "." -> ${workspace}).`),
+      glob: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Optional file glob filter (e.g. "*.ts", "src/**/*.js").'),
+      caseSensitive: z
+        .boolean()
+        .default(true)
+        .describe('Perform case-sensitive matching (default: true).'),
+      fixedStrings: z
+        .boolean()
+        .default(false)
+        .describe('Treat pattern as a literal string instead of a regex (default: false).'),
+      maxResults: z
+        .number()
+        .int()
+        .positive()
+        .max(500)
+        .default(100)
+        .describe('Maximum number of matching lines to return (default: 100).'),
+    }),
+    annotations: {
+      title: 'Search Files',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async ({
+      sandboxName,
+      pattern,
+      path: dirPath,
+      glob,
+      caseSensitive,
+      fixedStrings,
+      maxResults,
+    }) => {
+      try {
+        const resolvedPath = resolveSandboxPath(dirPath, workspace);
+        const res = await service.searchFiles(sandboxName, {
+          pattern,
+          path: resolvedPath,
+          glob,
+          caseSensitive,
+          fixedStrings,
+          maxResults,
+        });
+        return jsonText(res);
       } catch (err) {
         return errorText(err);
       }
