@@ -1,3 +1,4 @@
+import path from 'node:path';
 import {
   Sandboxes,
   bearer,
@@ -6,11 +7,34 @@ import {
   type Sandbox,
 } from '@docker/sandboxes';
 
+export const DEFAULT_WORKSPACE = '/workspace';
+
+export function resolveSandboxPath(
+  inputPath?: string,
+  baseDir: string = DEFAULT_WORKSPACE,
+): string {
+  const normalizedBase = path.posix.resolve('/', baseDir || DEFAULT_WORKSPACE);
+  if (!inputPath || inputPath === '.') {
+    return normalizedBase;
+  }
+  return path.posix.resolve(normalizedBase, inputPath);
+}
+
+export interface SandboxEnvironmentInfo {
+  user?: string;
+  home?: string;
+  platform?: string;
+  shell?: string;
+}
+
 export interface SandboxSummary {
   name: string;
   uid: string;
   displayName?: string;
   status: string;
+  workspace: string;
+  expiresAt?: string;
+  environment?: SandboxEnvironmentInfo;
 }
 
 export interface CommandResult {
@@ -72,6 +96,7 @@ export interface ApplyAndRunResult {
 }
 
 export interface SandboxService {
+  readonly workspace?: string;
   createSandbox(input: CreateSandboxInput): Promise<SandboxSummary>;
   listSandboxes(): Promise<SandboxSummary[]>;
   getSandbox(name: string): Promise<SandboxSummary>;
@@ -109,20 +134,35 @@ export function createDockerAuthenticator(config: DockerAuthConfig): Authenticat
   );
 }
 
-function toSandboxSummary(sandbox: Sandbox): SandboxSummary {
+function formatTimestamp(value: Date | string | undefined): string | undefined {
+  if (!value) return undefined;
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+function toSandboxSummary(
+  sandbox: Sandbox,
+  workspace: string,
+  environment?: SandboxEnvironmentInfo,
+): SandboxSummary {
+  const expiresAt = formatTimestamp(sandbox.effectiveFeatures?.timeouts?.expiresAt);
   return {
     name: sandbox.name,
     uid: sandbox.uid,
     displayName: sandbox.displayName,
     status: sandbox.status,
+    workspace,
+    ...(expiresAt ? { expiresAt } : {}),
+    ...(environment ? { environment } : {}),
   };
 }
 
 export class DockerSandboxService implements SandboxService {
   private readonly client: Sandboxes;
+  readonly workspace: string;
 
-  constructor(client: Sandboxes) {
+  constructor(client: Sandboxes, workspace: string = DEFAULT_WORKSPACE) {
     this.client = client;
+    this.workspace = resolveSandboxPath(workspace, DEFAULT_WORKSPACE);
   }
 
   static fromEnv(env: NodeJS.ProcessEnv = process.env): DockerSandboxService {
@@ -132,7 +172,35 @@ export class DockerSandboxService implements SandboxService {
       accessToken: env.DOCKER_ACCESS_TOKEN,
     });
     const client = new Sandboxes({ auth });
-    return new DockerSandboxService(client);
+    const workspace = env.SANDBOX_WORKSPACE?.trim() || DEFAULT_WORKSPACE;
+    return new DockerSandboxService(client, workspace);
+  }
+
+  private async probeEnvironment(sandbox: Sandbox): Promise<SandboxEnvironmentInfo | undefined> {
+    try {
+      const res = await sandbox.processes.run(
+        {
+          args: [
+            'sh',
+            '-c',
+            'printf "%s\\n%s\\n%s\\n%s\\n" "$(id -un 2>/dev/null || true)" "${HOME:-}" "$(uname -sm 2>/dev/null || true)" "${SHELL:-}"',
+          ],
+          workingDir: this.workspace,
+        },
+        { timeoutMs: 5_000 },
+      );
+      if (res.exitCode !== 0) return undefined;
+      const [user, home, platform, shell] = res.stdout.split('\n').map((s) => s.trim());
+      const info: SandboxEnvironmentInfo = {
+        ...(user ? { user } : {}),
+        ...(home ? { home } : {}),
+        ...(platform ? { platform } : {}),
+        ...(shell ? { shell } : {}),
+      };
+      return Object.keys(info).length > 0 ? info : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   async createSandbox(input: CreateSandboxInput): Promise<SandboxSummary> {
@@ -142,31 +210,33 @@ export class DockerSandboxService implements SandboxService {
       input.displayName ? { displayName: input.displayName } : undefined,
       input.timeoutMs ? { timeoutMs: input.timeoutMs } : undefined,
     );
-    return toSandboxSummary(sandbox);
+    await sandbox.files.mkdir(this.workspace, { parents: true }).catch(() => {});
+    const environment = await this.probeEnvironment(sandbox);
+    return toSandboxSummary(sandbox, this.workspace, environment);
   }
 
   async listSandboxes(): Promise<SandboxSummary[]> {
     const page = await this.client.list();
-    return page.items.map(toSandboxSummary);
+    return page.items.map((s) => toSandboxSummary(s, this.workspace));
   }
 
   async getSandbox(name: string): Promise<SandboxSummary> {
     const sandbox = await this.client.get(name);
-    return toSandboxSummary(sandbox);
+    return toSandboxSummary(sandbox, this.workspace);
   }
 
   async stopSandbox(name: string): Promise<SandboxSummary> {
     const sandbox = await this.client.get(name);
     const stopped = await sandbox.stop();
     const settled = await stopped.waitUntilStopped();
-    return toSandboxSummary(settled);
+    return toSandboxSummary(settled, this.workspace);
   }
 
   async startSandbox(name: string): Promise<SandboxSummary> {
     const sandbox = await this.client.get(name);
     const started = await sandbox.start();
     const running = await started.waitUntilRunning();
-    return toSandboxSummary(running);
+    return toSandboxSummary(running, this.workspace);
   }
 
   async deleteSandbox(name: string, force = true): Promise<{ deleted: string }> {
@@ -179,10 +249,11 @@ export class DockerSandboxService implements SandboxService {
 
   async runCommand(name: string, input: RunCommandInput): Promise<CommandResult> {
     const sandbox = await this.client.get(name);
+    const workingDir = resolveSandboxPath(input.cwd, this.workspace);
     const result = await sandbox.processes.run(
       {
         args: input.args,
-        ...(input.cwd ? { workdir: input.cwd } : {}),
+        workingDir,
         ...(input.env ? { env: input.env } : {}),
       },
       { timeoutMs: input.timeoutMs ?? 120_000 },
@@ -198,9 +269,10 @@ export class DockerSandboxService implements SandboxService {
 
   async startProcess(name: string, input: RunCommandInput): Promise<ProcessSummary> {
     const sandbox = await this.client.get(name);
+    const workingDir = resolveSandboxPath(input.cwd, this.workspace);
     const proc = await sandbox.processes.start({
       args: input.args,
-      ...(input.cwd ? { workdir: input.cwd } : {}),
+      workingDir,
       ...(input.env ? { env: input.env } : {}),
     });
     return {
@@ -233,20 +305,25 @@ export class DockerSandboxService implements SandboxService {
     const sandbox = await this.client.get(name);
     const writtenFiles: string[] = [];
     for (const file of files) {
-      await sandbox.files.write(file.path, file.content);
-      writtenFiles.push(file.path);
+      const targetPath = resolveSandboxPath(file.path, this.workspace);
+      await sandbox.files.write(targetPath, file.content);
+      writtenFiles.push(targetPath);
     }
     return { writtenFiles };
   }
 
-  async readFile(name: string, path: string, maxBytes = 256 * 1024): Promise<string> {
+  async readFile(name: string, filePath: string, maxBytes = 256 * 1024): Promise<string> {
     const sandbox = await this.client.get(name);
-    return sandbox.files.read(path, { encoding: 'utf8', maxBytes });
+    return sandbox.files.read(resolveSandboxPath(filePath, this.workspace), {
+      encoding: 'utf8',
+      maxBytes,
+    });
   }
 
-  async listFiles(name: string, path: string): Promise<FileEntry[]> {
+  async listFiles(name: string, dirPath: string): Promise<FileEntry[]> {
     const sandbox = await this.client.get(name);
-    const page = await sandbox.files.list(path);
+    const resolvedDir = resolveSandboxPath(dirPath, this.workspace);
+    const page = await sandbox.files.list(resolvedDir);
     return page.items.map((item) => {
       const record = item as Record<string, unknown>;
       return {
@@ -259,10 +336,15 @@ export class DockerSandboxService implements SandboxService {
   }
 
   async applyAndRun(name: string, input: ApplyAndRunInput): Promise<ApplyAndRunResult> {
-    const { writtenFiles } = await this.writeFiles(name, input.files);
+    const resolvedCwd = resolveSandboxPath(input.cwd, this.workspace);
+    const resolvedFiles = input.files.map((file) => ({
+      path: resolveSandboxPath(file.path, resolvedCwd),
+      content: file.content,
+    }));
+    const { writtenFiles } = await this.writeFiles(name, resolvedFiles);
     const commandResult = await this.runCommand(name, {
       args: input.args,
-      cwd: input.cwd,
+      cwd: resolvedCwd,
       env: input.env,
       timeoutMs: input.timeoutMs,
     });

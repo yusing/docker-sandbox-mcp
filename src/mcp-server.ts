@@ -7,7 +7,11 @@ import {
   type AuthConfig,
   type SandboxSession,
 } from './auth.js';
-import type { SandboxService } from './sandbox-service.js';
+import {
+  DEFAULT_WORKSPACE,
+  resolveSandboxPath,
+  type SandboxService,
+} from './sandbox-service.js';
 
 const MAX_OUTPUT_CHARS = 32_000;
 
@@ -51,6 +55,7 @@ export function createSandboxMcpServer({
   service,
   auth = {},
 }: CreateSandboxMcpServerOptions): SandboxMcpServerHandle {
+  const workspace = resolveSandboxPath(service.workspace, DEFAULT_WORKSPACE);
   let authProvider: SandboxGoogleProvider | undefined;
   let authenticate:
     | ((request: import('node:http').IncomingMessage) => Promise<SandboxSession | undefined>)
@@ -165,13 +170,16 @@ export function createSandboxMcpServer({
   server.addTool({
     name: 'apply_and_run',
     description:
-      'Write one or more files into a sandbox and execute a command (such as build or test) in a single step. Ideal for Gemini Web to minimize write confirmations.',
+      `Write one or more files into a sandbox and execute a command (such as build or test) in a single step. Relative paths resolve against cwd (default: ${workspace}). Ideal for Gemini Web to minimize write confirmations.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the target sandbox.'),
       files: z
         .array(
           z.object({
-            path: z.string().min(1).describe('Absolute path inside the sandbox.'),
+            path: z
+              .string()
+              .min(1)
+              .describe(`File path inside the sandbox (relative to cwd or absolute; default cwd: ${workspace}).`),
             content: z.string().describe('UTF-8 file contents to write.'),
           }),
         )
@@ -181,7 +189,11 @@ export function createSandboxMcpServer({
         .array(z.string().min(1))
         .min(1)
         .describe('Command and arguments to execute (e.g. ["sh", "-c", "npm test"]).'),
-      cwd: z.string().min(1).optional().describe('Working directory inside the sandbox.'),
+      cwd: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(`Working directory inside the sandbox (relative to ${workspace} or absolute; default: ${workspace}).`),
       env: z
         .record(z.string(), z.string())
         .optional()
@@ -203,14 +215,20 @@ export function createSandboxMcpServer({
     },
     execute: async ({ sandboxName, files, args, cwd, env, timeoutMs }) => {
       try {
+        const resolvedCwd = resolveSandboxPath(cwd, workspace);
+        const resolvedFiles = files.map((f) => ({
+          path: resolveSandboxPath(f.path, resolvedCwd),
+          content: f.content,
+        }));
         const res = await service.applyAndRun(sandboxName, {
-          files,
+          files: resolvedFiles,
           args,
-          cwd,
+          cwd: resolvedCwd,
           env,
           timeoutMs,
         });
         return jsonText({
+          cwd: resolvedCwd,
           writtenFiles: res.writtenFiles,
           exitCode: res.commandResult.exitCode,
           incomplete: res.commandResult.incomplete,
@@ -226,14 +244,18 @@ export function createSandboxMcpServer({
   server.addTool({
     name: 'run_command',
     description:
-      'Execute a command inside a running Docker Cloud Sandbox and return exit code, stdout, and stderr.',
+      `Execute a command inside a running Docker Cloud Sandbox and return exit code, stdout, and stderr. Defaults to ${workspace}.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the target sandbox.'),
       args: z
         .array(z.string().min(1))
         .min(1)
         .describe('Command and arguments to execute (e.g. ["bash", "-lc", "pytest"]).'),
-      cwd: z.string().min(1).optional().describe('Working directory inside the sandbox.'),
+      cwd: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(`Working directory inside the sandbox (relative to ${workspace} or absolute; default: ${workspace}).`),
       env: z.record(z.string(), z.string()).optional().describe('Optional environment variables.'),
       timeoutMs: z
         .number()
@@ -252,8 +274,15 @@ export function createSandboxMcpServer({
     },
     execute: async ({ sandboxName, args, cwd, env, timeoutMs }) => {
       try {
-        const res = await service.runCommand(sandboxName, { args, cwd, env, timeoutMs });
+        const resolvedCwd = resolveSandboxPath(cwd, workspace);
+        const res = await service.runCommand(sandboxName, {
+          args,
+          cwd: resolvedCwd,
+          env,
+          timeoutMs,
+        });
         return jsonText({
+          cwd: resolvedCwd,
           exitCode: res.exitCode,
           incomplete: res.incomplete,
           processName: res.processName,
@@ -269,11 +298,15 @@ export function createSandboxMcpServer({
   server.addTool({
     name: 'start_background_process',
     description:
-      'Start a long-running command asynchronously inside a sandbox (such as a dev server or large build) and return its process handle for polling with get_process_output.',
+      `Start a long-running command asynchronously inside a sandbox (such as a dev server or large build) and return its process handle for polling with get_process_output. Defaults to ${workspace}.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the target sandbox.'),
       args: z.array(z.string().min(1)).min(1).describe('Command and arguments to execute.'),
-      cwd: z.string().min(1).optional().describe('Working directory inside the sandbox.'),
+      cwd: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(`Working directory inside the sandbox (relative to ${workspace} or absolute; default: ${workspace}).`),
       env: z.record(z.string(), z.string()).optional().describe('Optional environment variables.'),
     }),
     annotations: {
@@ -285,7 +318,12 @@ export function createSandboxMcpServer({
     },
     execute: async ({ sandboxName, args, cwd, env }) => {
       try {
-        const proc = await service.startProcess(sandboxName, { args, cwd, env });
+        const resolvedCwd = resolveSandboxPath(cwd, workspace);
+        const proc = await service.startProcess(sandboxName, {
+          args,
+          cwd: resolvedCwd,
+          env,
+        });
         return jsonText(proc);
       } catch (err) {
         return errorText(err);
@@ -324,10 +362,13 @@ export function createSandboxMcpServer({
 
   server.addTool({
     name: 'read_file',
-    description: 'Read a UTF-8 text file from a Docker Cloud Sandbox.',
+    description: `Read a UTF-8 text file from a Docker Cloud Sandbox. Relative paths resolve against ${workspace}.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
-      path: z.string().min(1).describe('Absolute path to the file inside the sandbox.'),
+      path: z
+        .string()
+        .min(1)
+        .describe(`File path inside the sandbox (relative to ${workspace} or absolute).`),
       maxBytes: z
         .number()
         .int()
@@ -342,9 +383,10 @@ export function createSandboxMcpServer({
       idempotentHint: true,
       openWorldHint: false,
     },
-    execute: async ({ sandboxName, path, maxBytes }) => {
+    execute: async ({ sandboxName, path: filePath, maxBytes }) => {
       try {
-        const content = await service.readFile(sandboxName, path, maxBytes);
+        const resolvedPath = resolveSandboxPath(filePath, workspace);
+        const content = await service.readFile(sandboxName, resolvedPath, maxBytes);
         return {
           content: [{ type: 'text', text: truncateOutput(content) }],
         };
@@ -356,10 +398,14 @@ export function createSandboxMcpServer({
 
   server.addTool({
     name: 'list_files',
-    description: 'List files and directories at a given path inside a Docker Cloud Sandbox.',
+    description: `List files and directories at a given path inside a Docker Cloud Sandbox. Defaults to ${workspace}.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
-      path: z.string().min(1).default('/').describe('Directory path inside the sandbox.'),
+      path: z
+        .string()
+        .min(1)
+        .default('.')
+        .describe(`Directory path inside the sandbox (relative to ${workspace} or absolute; default: "." -> ${workspace}).`),
     }),
     annotations: {
       title: 'List Files',
@@ -367,10 +413,11 @@ export function createSandboxMcpServer({
       idempotentHint: true,
       openWorldHint: false,
     },
-    execute: async ({ sandboxName, path }) => {
+    execute: async ({ sandboxName, path: dirPath }) => {
       try {
-        const entries = await service.listFiles(sandboxName, path);
-        return jsonText({ path, entries });
+        const resolvedPath = resolveSandboxPath(dirPath, workspace);
+        const entries = await service.listFiles(sandboxName, resolvedPath);
+        return jsonText({ path: resolvedPath, entries });
       } catch (err) {
         return errorText(err);
       }

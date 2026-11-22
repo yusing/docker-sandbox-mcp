@@ -5,7 +5,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { createSandboxMcpServer } from '../src/mcp-server.js';
 import {
+  DEFAULT_WORKSPACE,
   createDockerAuthenticator,
+  resolveSandboxPath,
   type ApplyAndRunInput,
   type ApplyAndRunResult,
   type CommandResult,
@@ -30,10 +32,13 @@ async function getFreePort(): Promise<number> {
 }
 
 class MockSandboxService implements SandboxService {
+  readonly workspace = DEFAULT_WORKSPACE;
   private counter = 0;
   private sandboxes = new Map<string, SandboxSummary>();
   private files = new Map<string, Map<string, string>>();
   private processes = new Map<string, Map<string, ProcessOutputResult>>();
+  lastRunCwd?: string;
+  lastStartProcessCwd?: string;
 
   async createSandbox(input: CreateSandboxInput): Promise<SandboxSummary> {
     this.counter += 1;
@@ -44,6 +49,13 @@ class MockSandboxService implements SandboxService {
       uid,
       displayName: input.displayName ?? input.kit ?? 'shell',
       status: 'RUNNING',
+      workspace: this.workspace,
+      environment: {
+        user: 'agent',
+        home: '/home/agent',
+        platform: 'Linux x86_64',
+        shell: '/bin/bash',
+      },
     };
     this.sandboxes.set(name, summary);
     this.files.set(name, new Map());
@@ -83,6 +95,7 @@ class MockSandboxService implements SandboxService {
 
   async runCommand(name: string, input: RunCommandInput): Promise<CommandResult> {
     await this.getSandbox(name);
+    this.lastRunCwd = input.cwd;
     return {
       exitCode: 0,
       stdout: `ran: ${input.args.join(' ')}`,
@@ -92,8 +105,9 @@ class MockSandboxService implements SandboxService {
     };
   }
 
-  async startProcess(name: string, _input: RunCommandInput): Promise<ProcessSummary> {
+  async startProcess(name: string, input: RunCommandInput): Promise<ProcessSummary> {
     await this.getSandbox(name);
+    this.lastStartProcessCwd = input.cwd;
     const procName = `${name}/processes/bg-1`;
     const summary: ProcessSummary = {
       name: procName,
@@ -223,31 +237,46 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       const created = JSON.parse((createdRes.content as Array<{ text: string }>)[0].text);
       assert.equal(created.name, 'sandboxes/sbx-1');
       assert.equal(created.status, 'RUNNING');
+      assert.equal(created.workspace, '/workspace');
+      assert.equal(created.environment.user, 'agent');
 
       const applyRes = await client.callTool({
         name: 'apply_and_run',
         arguments: {
           sandboxName: created.name,
-          files: [{ path: '/workspace/hello.txt', content: 'hello world' }],
-          args: ['sh', '-c', 'cat /workspace/hello.txt'],
+          cwd: 'app',
+          files: [{ path: 'hello.txt', content: 'hello world' }],
+          args: ['sh', '-c', 'cat hello.txt'],
         },
       });
       const applied = JSON.parse((applyRes.content as Array<{ text: string }>)[0].text);
-      assert.deepEqual(applied.writtenFiles, ['/workspace/hello.txt']);
+      assert.equal(applied.cwd, '/workspace/app');
+      assert.deepEqual(applied.writtenFiles, ['/workspace/app/hello.txt']);
+      assert.equal(service.lastRunCwd, '/workspace/app');
       assert.equal(applied.exitCode, 0);
-      assert.match(applied.stdout, /ran: sh -c cat \/workspace\/hello.txt/);
+      assert.match(applied.stdout, /ran: sh -c cat hello.txt/);
 
       const readRes = await client.callTool({
         name: 'read_file',
-        arguments: { sandboxName: created.name, path: '/workspace/hello.txt' },
+        arguments: { sandboxName: created.name, path: 'app/hello.txt' },
       });
       assert.equal((readRes.content as Array<{ text: string }>)[0].text, 'hello world');
+
+      const listedFilesRes = await client.callTool({
+        name: 'list_files',
+        arguments: { sandboxName: created.name },
+      });
+      const listedFiles = JSON.parse((listedFilesRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(listedFiles.path, '/workspace');
+      assert.equal(listedFiles.entries.length, 1);
+      assert.equal(listedFiles.entries[0].path, '/workspace/app/hello.txt');
 
       const bgRes = await client.callTool({
         name: 'start_background_process',
         arguments: { sandboxName: created.name, args: ['node', 'server.js'] },
       });
       const bg = JSON.parse((bgRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(service.lastStartProcessCwd, '/workspace');
       const outRes = await client.callTool({
         name: 'get_process_output',
         arguments: { sandboxName: created.name, processName: bg.name },
@@ -273,6 +302,14 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       await handle.server.stop();
       handle.destroy();
     }
+  });
+
+  it('resolves sandbox paths relative to workspace and preserves absolute paths', () => {
+    assert.equal(resolveSandboxPath(undefined), '/workspace');
+    assert.equal(resolveSandboxPath('.'), '/workspace');
+    assert.equal(resolveSandboxPath('src/index.ts'), '/workspace/src/index.ts');
+    assert.equal(resolveSandboxPath('../other', '/workspace/app'), '/workspace/other');
+    assert.equal(resolveSandboxPath('/etc/hosts', '/workspace/app'), '/etc/hosts');
   });
 
   it('throws clear error when Docker credentials are missing', () => {
