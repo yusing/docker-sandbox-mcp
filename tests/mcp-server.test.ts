@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { createSandboxMcpServer, formatFileLines } from '../src/mcp-server.js';
 import {
   DEFAULT_WORKSPACE,
+  applyTextEdit,
   createDockerAuthenticator,
   matchesGlob,
   resolveCommandArgs,
@@ -14,7 +15,10 @@ import {
   type ApplyAndRunResult,
   type CommandResult,
   type CreateSandboxInput,
+  type FileEditInput,
+  type FileEditResult,
   type FileEntry,
+  type FileStatResult,
   type FileWriteInput,
   type GlobFilesInput,
   type GlobFilesResult,
@@ -148,11 +152,54 @@ class MockSandboxService implements SandboxService {
     return { writtenFiles };
   }
 
+  async editFile(name: string, input: FileEditInput): Promise<FileEditResult> {
+    await this.getSandbox(name);
+    const store = this.files.get(name)!;
+    const current = store.get(input.path);
+    if (current === undefined) throw new Error(`File not found: ${input.path}`);
+    const { content, replacements } = applyTextEdit(current, input);
+    store.set(input.path, content);
+    return { path: input.path, replacements };
+  }
+
   async readFile(name: string, path: string): Promise<string> {
     await this.getSandbox(name);
     const content = this.files.get(name)?.get(path);
     if (content === undefined) throw new Error(`File not found: ${path}`);
     return content;
+  }
+
+  async statFile(name: string, filePath: string): Promise<FileStatResult> {
+    await this.getSandbox(name);
+    const content = this.files.get(name)?.get(filePath);
+    if (content === undefined) throw new Error(`File not found: ${filePath}`);
+    return { path: filePath, isDir: false, type: 'regular', size: content.length };
+  }
+
+  async mkdir(name: string, dirPath: string): Promise<{ path: string }> {
+    await this.getSandbox(name);
+    return { path: dirPath };
+  }
+
+  async moveFile(name: string, from: string, to: string): Promise<{ from: string; to: string }> {
+    await this.getSandbox(name);
+    const store = this.files.get(name)!;
+    const content = store.get(from);
+    if (content === undefined) throw new Error(`File not found: ${from}`);
+    store.delete(from);
+    store.set(to, content);
+    return { from, to };
+  }
+
+  async removeFile(
+    name: string,
+    targetPath: string,
+    recursive = false,
+  ): Promise<{ removed: string; recursive: boolean }> {
+    await this.getSandbox(name);
+    const store = this.files.get(name)!;
+    store.delete(targetPath);
+    return { removed: targetPath, recursive };
   }
 
   async listFiles(
@@ -236,14 +283,37 @@ class MockSandboxService implements SandboxService {
   }
 
   async applyAndRun(name: string, input: ApplyAndRunInput): Promise<ApplyAndRunResult> {
-    const { writtenFiles } = await this.writeFiles(name, input.files);
-    const commandResult = await this.runCommand(name, {
-      args: input.args,
-      cwd: input.cwd,
-      env: input.env,
-      timeoutMs: input.timeoutMs,
-    });
-    return { writtenFiles, commandResult };
+    const files = input.files ?? [];
+    const edits = input.edits ?? [];
+    const deletes = input.deletes ?? [];
+    const { writtenFiles } =
+      files.length > 0 ? await this.writeFiles(name, files) : { writtenFiles: [] };
+    const editedFiles: FileEditResult[] = [];
+    for (const edit of edits) {
+      editedFiles.push(await this.editFile(name, edit));
+    }
+    const deletedFiles: string[] = [];
+    for (const delPath of deletes) {
+      const { removed } = await this.removeFile(name, delPath, false);
+      deletedFiles.push(removed);
+    }
+    const hasCommand =
+      input.command !== undefined || (input.args !== undefined && input.args.length > 0);
+    const commandResult = hasCommand
+      ? await this.runCommand(name, {
+          command: input.command,
+          args: input.args,
+          cwd: input.cwd,
+          env: input.env,
+          timeoutMs: input.timeoutMs,
+        })
+      : undefined;
+    return {
+      writtenFiles,
+      editedFiles,
+      deletedFiles,
+      ...(commandResult ? { commandResult } : {}),
+    };
   }
 
   async close(): Promise<void> {}
@@ -304,8 +374,11 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       assert.equal(toolMap.get('list_files')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('glob_files')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('search_files')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('stat_file')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('get_process_output')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('apply_and_run')?.annotations?.readOnlyHint, false);
+      assert.equal(toolMap.get('edit_file')?.annotations?.readOnlyHint, false);
+      assert.equal(toolMap.get('remove_file')?.annotations?.destructiveHint, true);
       assert.equal(toolMap.get('delete_sandbox')?.annotations?.destructiveHint, true);
 
       const createdRes = await client.callTool({
@@ -377,6 +450,69 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       assert.deepEqual(searched.matches, [
         { path: '/workspace/app/hello.txt', line: 2, text: 'hello world' },
       ]);
+
+      // Targeted edit_file, file-only apply_and_run, stat/mkdir/move/remove
+      const editRes = await client.callTool({
+        name: 'edit_file',
+        arguments: {
+          sandboxName: created.name,
+          path: 'app/hello.txt',
+          oldText: 'hello world',
+          newText: 'hello sandbox',
+        },
+      });
+      assert.deepEqual(JSON.parse((editRes.content as Array<{ text: string }>)[0].text), {
+        path: '/workspace/app/hello.txt',
+        replacements: 1,
+      });
+
+      const writeOnlyRes = await client.callTool({
+        name: 'apply_and_run',
+        arguments: {
+          sandboxName: created.name,
+          cwd: 'app',
+          files: [{ path: 'temp.txt', content: 'tmp' }],
+          edits: [{ path: 'hello.txt', oldText: 'line3', newText: 'line3-updated' }],
+        },
+      });
+      const writeOnly = JSON.parse((writeOnlyRes.content as Array<{ text: string }>)[0].text);
+      assert.deepEqual(writeOnly.writtenFiles, ['/workspace/app/temp.txt']);
+      assert.deepEqual(writeOnly.editedFiles, [{ path: '/workspace/app/hello.txt', replacements: 1 }]);
+      assert.equal(writeOnly.exitCode, undefined);
+
+      const statRes = await client.callTool({
+        name: 'stat_file',
+        arguments: { sandboxName: created.name, path: 'app/temp.txt' },
+      });
+      assert.equal(JSON.parse((statRes.content as Array<{ text: string }>)[0].text).size, 3);
+
+      const mkdirRes = await client.callTool({
+        name: 'mkdir',
+        arguments: { sandboxName: created.name, path: 'app/sub' },
+      });
+      assert.equal(
+        JSON.parse((mkdirRes.content as Array<{ text: string }>)[0].text).path,
+        '/workspace/app/sub',
+      );
+
+      await client.callTool({
+        name: 'move_file',
+        arguments: { sandboxName: created.name, from: 'app/temp.txt', to: 'app/moved.txt' },
+      });
+      const movedRead = await client.callTool({
+        name: 'read_file',
+        arguments: { sandboxName: created.name, path: 'app/moved.txt', lineNumbers: false },
+      });
+      assert.equal((movedRead.content as Array<{ text: string }>)[0].text, 'tmp');
+
+      const rmRes = await client.callTool({
+        name: 'remove_file',
+        arguments: { sandboxName: created.name, path: 'app/moved.txt' },
+      });
+      assert.deepEqual(JSON.parse((rmRes.content as Array<{ text: string }>)[0].text), {
+        removed: '/workspace/app/moved.txt',
+        recursive: false,
+      });
 
       const runCmdRes = await client.callTool({
         name: 'run_command',
@@ -466,6 +602,25 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
     assert.equal(matchesGlob('src/mcp-server.ts', '**/*.ts'), true);
     assert.equal(matchesGlob('src/mcp-server.ts', '*.ts'), true);
     assert.equal(matchesGlob('src/mcp-server.ts', '**/*.{js,json}'), false);
+  });
+
+  it('applies targeted text edits and enforces uniqueness unless replaceAll is set', () => {
+    assert.deepEqual(
+      applyTextEdit('foo bar foo', { oldText: 'bar', newText: '$&baz' }),
+      { content: 'foo $&baz foo', replacements: 1 },
+    );
+    assert.throws(
+      () => applyTextEdit('foo bar foo', { oldText: 'foo', newText: 'qux' }),
+      /matched 2 times/,
+    );
+    assert.deepEqual(
+      applyTextEdit('foo bar foo', { oldText: 'foo', newText: 'qux', replaceAll: true }),
+      { content: 'qux bar qux', replacements: 2 },
+    );
+    assert.throws(
+      () => applyTextEdit('hello', { oldText: 'missing', newText: 'x' }),
+      /not found/,
+    );
   });
 
   it('throws clear error when Docker credentials are missing', () => {

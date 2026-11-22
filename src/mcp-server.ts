@@ -210,7 +210,7 @@ export function createSandboxMcpServer({
   server.addTool({
     name: 'apply_and_run',
     description:
-      `Write one or more files into a sandbox and execute a command (such as build or test) in a single step. Relative paths resolve against cwd (default: ${workspace}). Provide either command (shell string) or args (argv array). Ideal for Gemini Web to minimize write confirmations.`,
+      `Write, edit, or delete files in a sandbox and optionally execute a command (such as build or test) in a single step. Relative paths resolve against cwd (default: ${workspace}). Command/args are optional for file-only batches. Ideal for Gemini Web to minimize write confirmations.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the target sandbox.'),
       files: z
@@ -225,16 +225,37 @@ export function createSandboxMcpServer({
         )
         .default([])
         .describe('Files to write before running the command.'),
+      edits: z
+        .array(
+          z.object({
+            path: z
+              .string()
+              .min(1)
+              .describe(`File path to edit (relative to cwd or absolute; default cwd: ${workspace}).`),
+            oldText: z.string().min(1).describe('Exact text to replace.'),
+            newText: z.string().describe('Replacement text.'),
+            replaceAll: z
+              .boolean()
+              .default(false)
+              .describe('Replace all occurrences instead of requiring a single unique match (default: false).'),
+          }),
+        )
+        .default([])
+        .describe('Targeted search/replace edits to apply after writing files.'),
+      deletes: z
+        .array(z.string().min(1))
+        .default([])
+        .describe(`File paths to delete (relative to cwd or absolute; default cwd: ${workspace}).`),
       command: z
         .string()
         .min(1)
         .optional()
-        .describe('Shell command string executed via `bash -lc` (supports pipes, &&, redirects, globs). Mutually exclusive with args.'),
+        .describe('Optional shell command string executed via `bash -lc` (supports pipes, &&, redirects, globs). Mutually exclusive with args.'),
       args: z
         .array(z.string().min(1))
         .min(1)
         .optional()
-        .describe('Direct argv array to execute without a shell (e.g. ["npm", "test"]). Mutually exclusive with command.'),
+        .describe('Optional direct argv array to execute without a shell (e.g. ["npm", "test"]). Mutually exclusive with command.'),
       cwd: z
         .string()
         .min(1)
@@ -259,17 +280,30 @@ export function createSandboxMcpServer({
       idempotentHint: false,
       openWorldHint: false,
     },
-    execute: async ({ sandboxName, files, command, args, cwd, env, timeoutMs }) => {
+    execute: async ({ sandboxName, files, edits, deletes, command, args, cwd, env, timeoutMs }) => {
       try {
-        const resolvedArgs = resolveCommandArgs({ command, args });
+        const hasCommand = command !== undefined || (args !== undefined && args.length > 0);
+        const resolvedArgs = hasCommand ? resolveCommandArgs({ command, args }) : undefined;
+        if (!resolvedArgs && files.length === 0 && edits.length === 0 && deletes.length === 0) {
+          throw new Error(
+            'Provide at least one file operation (files, edits, deletes) or a command/args to run.',
+          );
+        }
         const resolvedCwd = resolveSandboxPath(cwd, workspace);
         const resolvedFiles = files.map((f) => ({
           path: resolveSandboxPath(f.path, resolvedCwd),
           content: f.content,
         }));
+        const resolvedEdits = edits.map((e) => ({
+          ...e,
+          path: resolveSandboxPath(e.path, resolvedCwd),
+        }));
+        const resolvedDeletes = deletes.map((d) => resolveSandboxPath(d, resolvedCwd));
         const res = await service.applyAndRun(sandboxName, {
           files: resolvedFiles,
-          args: resolvedArgs,
+          edits: resolvedEdits,
+          deletes: resolvedDeletes,
+          ...(resolvedArgs ? { args: resolvedArgs } : {}),
           cwd: resolvedCwd,
           env,
           timeoutMs,
@@ -277,10 +311,16 @@ export function createSandboxMcpServer({
         return jsonText({
           cwd: resolvedCwd,
           writtenFiles: res.writtenFiles,
-          exitCode: res.commandResult.exitCode,
-          incomplete: res.commandResult.incomplete,
-          stdout: truncateOutput(res.commandResult.stdout),
-          stderr: truncateOutput(res.commandResult.stderr),
+          ...(res.editedFiles.length > 0 ? { editedFiles: res.editedFiles } : {}),
+          ...(res.deletedFiles.length > 0 ? { deletedFiles: res.deletedFiles } : {}),
+          ...(res.commandResult
+            ? {
+                exitCode: res.commandResult.exitCode,
+                incomplete: res.commandResult.incomplete,
+                stdout: truncateOutput(res.commandResult.stdout),
+                stderr: truncateOutput(res.commandResult.stderr),
+              }
+            : {}),
         });
       } catch (err) {
         return errorText(err);
@@ -627,6 +667,169 @@ export function createSandboxMcpServer({
           fixedStrings,
           maxResults,
         });
+        return jsonText(res);
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'edit_file',
+    description: `Apply a targeted search-and-replace edit to a UTF-8 file inside a Docker Cloud Sandbox without rewriting the entire file. Relative paths resolve against ${workspace}.`,
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+      path: z
+        .string()
+        .min(1)
+        .describe(`File path inside the sandbox (relative to ${workspace} or absolute).`),
+      oldText: z.string().min(1).describe('Exact text to find and replace.'),
+      newText: z.string().describe('Replacement text.'),
+      replaceAll: z
+        .boolean()
+        .default(false)
+        .describe('Replace every occurrence instead of requiring a single unique match (default: false).'),
+    }),
+    annotations: {
+      title: 'Edit File',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName, path: filePath, oldText, newText, replaceAll }) => {
+      try {
+        const resolvedPath = resolveSandboxPath(filePath, workspace);
+        const res = await service.editFile(sandboxName, {
+          path: resolvedPath,
+          oldText,
+          newText,
+          replaceAll,
+        });
+        return jsonText(res);
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'stat_file',
+    description: `Inspect metadata (type, size, mode, symlink target) for a path inside a Docker Cloud Sandbox. Relative paths resolve against ${workspace}.`,
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+      path: z
+        .string()
+        .min(1)
+        .describe(`Path inside the sandbox (relative to ${workspace} or absolute).`),
+    }),
+    annotations: {
+      title: 'Stat File',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName, path: filePath }) => {
+      try {
+        const resolvedPath = resolveSandboxPath(filePath, workspace);
+        const info = await service.statFile(sandboxName, resolvedPath);
+        return jsonText(info);
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'mkdir',
+    description: `Create a directory (and parent directories by default) inside a Docker Cloud Sandbox. Relative paths resolve against ${workspace}.`,
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+      path: z
+        .string()
+        .min(1)
+        .describe(`Directory path to create (relative to ${workspace} or absolute).`),
+      parents: z
+        .boolean()
+        .default(true)
+        .describe('Create parent directories as needed (default: true).'),
+    }),
+    annotations: {
+      title: 'Create Directory',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName, path: dirPath, parents }) => {
+      try {
+        const resolvedPath = resolveSandboxPath(dirPath, workspace);
+        const res = await service.mkdir(sandboxName, resolvedPath, parents);
+        return jsonText(res);
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'move_file',
+    description: `Move or rename a file or directory inside a Docker Cloud Sandbox. Relative paths resolve against ${workspace}.`,
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+      from: z
+        .string()
+        .min(1)
+        .describe(`Source path (relative to ${workspace} or absolute).`),
+      to: z
+        .string()
+        .min(1)
+        .describe(`Destination path (relative to ${workspace} or absolute).`),
+    }),
+    annotations: {
+      title: 'Move File',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName, from, to }) => {
+      try {
+        const resolvedFrom = resolveSandboxPath(from, workspace);
+        const resolvedTo = resolveSandboxPath(to, workspace);
+        const res = await service.moveFile(sandboxName, resolvedFrom, resolvedTo);
+        return jsonText(res);
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'remove_file',
+    description: `Delete a file or directory inside a Docker Cloud Sandbox. Relative paths resolve against ${workspace}.`,
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+      path: z
+        .string()
+        .min(1)
+        .describe(`Path to delete (relative to ${workspace} or absolute).`),
+      recursive: z
+        .boolean()
+        .default(false)
+        .describe('Recursively delete directories and their contents (default: false).'),
+    }),
+    annotations: {
+      title: 'Remove File',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName, path: targetPath, recursive }) => {
+      try {
+        const resolvedPath = resolveSandboxPath(targetPath, workspace);
+        const res = await service.removeFile(sandboxName, resolvedPath, recursive);
         return jsonText(res);
       } catch (err) {
         return errorText(err);

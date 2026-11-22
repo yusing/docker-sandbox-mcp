@@ -163,6 +163,58 @@ export interface FileWriteInput {
   content: string;
 }
 
+export interface FileEditInput {
+  path: string;
+  oldText: string;
+  newText: string;
+  replaceAll?: boolean;
+}
+
+export interface FileEditResult {
+  path: string;
+  replacements: number;
+}
+
+export interface FileStatResult {
+  path: string;
+  isDir: boolean;
+  type: string;
+  size?: number;
+  mode?: number;
+  linkTarget?: string;
+}
+
+export function applyTextEdit(
+  content: string,
+  edit: { oldText: string; newText: string; replaceAll?: boolean },
+): { content: string; replacements: number } {
+  const { oldText, newText, replaceAll = false } = edit;
+  if (!oldText) {
+    throw new Error('oldText must not be empty.');
+  }
+  if (oldText === newText) {
+    throw new Error('newText must differ from oldText.');
+  }
+  const parts = content.split(oldText);
+  const count = parts.length - 1;
+  if (count === 0) {
+    throw new Error('oldText not found in file.');
+  }
+  if (count > 1 && !replaceAll) {
+    throw new Error(
+      `oldText matched ${count} times; provide more surrounding context or set replaceAll: true.`,
+    );
+  }
+  if (replaceAll) {
+    return { content: parts.join(newText), replacements: count };
+  }
+  const idx = content.indexOf(oldText);
+  return {
+    content: content.slice(0, idx) + newText + content.slice(idx + oldText.length),
+    replacements: 1,
+  };
+}
+
 export interface CreateSandboxInput {
   kit?: string;
   displayName?: string;
@@ -196,7 +248,9 @@ export interface RunCommandInput {
 }
 
 export interface ApplyAndRunInput {
-  files: FileWriteInput[];
+  files?: FileWriteInput[];
+  edits?: FileEditInput[];
+  deletes?: string[];
   command?: string;
   args?: string[];
   cwd?: string;
@@ -206,7 +260,9 @@ export interface ApplyAndRunInput {
 
 export interface ApplyAndRunResult {
   writtenFiles: string[];
-  commandResult: CommandResult;
+  editedFiles: FileEditResult[];
+  deletedFiles: string[];
+  commandResult?: CommandResult;
 }
 
 export interface SandboxService {
@@ -221,7 +277,16 @@ export interface SandboxService {
   startProcess(name: string, input: RunCommandInput): Promise<ProcessSummary>;
   getProcessOutput(name: string, processName: string): Promise<ProcessOutputResult>;
   writeFiles(name: string, files: FileWriteInput[]): Promise<{ writtenFiles: string[] }>;
+  editFile(name: string, input: FileEditInput): Promise<FileEditResult>;
   readFile(name: string, path: string, maxBytes?: number): Promise<string>;
+  statFile(name: string, path: string): Promise<FileStatResult>;
+  mkdir(name: string, path: string, parents?: boolean): Promise<{ path: string }>;
+  moveFile(name: string, from: string, to: string): Promise<{ from: string; to: string }>;
+  removeFile(
+    name: string,
+    path: string,
+    recursive?: boolean,
+  ): Promise<{ removed: string; recursive: boolean }>;
   listFiles(name: string, path: string, options?: ListFilesOptions): Promise<FileEntry[]>;
   globFiles(name: string, input: GlobFilesInput): Promise<GlobFilesResult>;
   searchFiles(name: string, input: SearchFilesInput): Promise<SearchFilesResult>;
@@ -430,12 +495,70 @@ export class DockerSandboxService implements SandboxService {
     return { writtenFiles };
   }
 
+  async editFile(name: string, input: FileEditInput): Promise<FileEditResult> {
+    const sandbox = await this.client.get(name);
+    const targetPath = resolveSandboxPath(input.path, this.workspace);
+    const current = await sandbox.files.read(targetPath, { encoding: 'utf8' });
+    const { content, replacements } = applyTextEdit(current, input);
+    await sandbox.files.write(targetPath, content);
+    return { path: targetPath, replacements };
+  }
+
   async readFile(name: string, filePath: string, maxBytes = 256 * 1024): Promise<string> {
     const sandbox = await this.client.get(name);
     return sandbox.files.read(resolveSandboxPath(filePath, this.workspace), {
       encoding: 'utf8',
       maxBytes,
     });
+  }
+
+  async statFile(name: string, filePath: string): Promise<FileStatResult> {
+    const sandbox = await this.client.get(name);
+    const resolvedPath = resolveSandboxPath(filePath, this.workspace);
+    const res = await sandbox.files.stat(resolvedPath);
+    const info = res.info;
+    const rawSize = info?.size;
+    const size =
+      typeof rawSize === 'number'
+        ? rawSize
+        : typeof rawSize === 'string' && rawSize.trim() !== '' && !Number.isNaN(Number(rawSize))
+          ? Number(rawSize)
+          : undefined;
+    const type = info?.type ?? (info?.isDir ? 'directory' : 'regular');
+    return {
+      path: info?.path ? resolveSandboxPath(info.path, this.workspace) : resolvedPath,
+      isDir: Boolean(info?.isDir ?? info?.type === 'directory'),
+      type,
+      ...(size !== undefined ? { size } : {}),
+      ...(info?.mode !== undefined ? { mode: info.mode } : {}),
+      ...(info?.linkTarget ? { linkTarget: info.linkTarget } : {}),
+    };
+  }
+
+  async mkdir(name: string, dirPath: string, parents = true): Promise<{ path: string }> {
+    const sandbox = await this.client.get(name);
+    const resolvedPath = resolveSandboxPath(dirPath, this.workspace);
+    await sandbox.files.mkdir(resolvedPath, { parents });
+    return { path: resolvedPath };
+  }
+
+  async moveFile(name: string, from: string, to: string): Promise<{ from: string; to: string }> {
+    const sandbox = await this.client.get(name);
+    const resolvedFrom = resolveSandboxPath(from, this.workspace);
+    const resolvedTo = resolveSandboxPath(to, this.workspace);
+    await sandbox.files.move(resolvedFrom, resolvedTo);
+    return { from: resolvedFrom, to: resolvedTo };
+  }
+
+  async removeFile(
+    name: string,
+    targetPath: string,
+    recursive = false,
+  ): Promise<{ removed: string; recursive: boolean }> {
+    const sandbox = await this.client.get(name);
+    const resolvedPath = resolveSandboxPath(targetPath, this.workspace);
+    await sandbox.files.remove(resolvedPath, { recursive });
+    return { removed: resolvedPath, recursive };
   }
 
   async listFiles(
@@ -584,20 +707,55 @@ export class DockerSandboxService implements SandboxService {
   }
 
   async applyAndRun(name: string, input: ApplyAndRunInput): Promise<ApplyAndRunResult> {
-    const args = resolveCommandArgs(input);
+    const files = input.files ?? [];
+    const edits = input.edits ?? [];
+    const deletes = input.deletes ?? [];
+    const hasCommand = input.command !== undefined || (input.args !== undefined && input.args.length > 0);
+    const args = hasCommand ? resolveCommandArgs(input) : undefined;
+
+    if (!args && files.length === 0 && edits.length === 0 && deletes.length === 0) {
+      throw new Error(
+        'Provide at least one file operation (files, edits, deletes) or a command/args to run.',
+      );
+    }
+
     const resolvedCwd = resolveSandboxPath(input.cwd, this.workspace);
-    const resolvedFiles = input.files.map((file) => ({
+    const resolvedFiles = files.map((file) => ({
       path: resolveSandboxPath(file.path, resolvedCwd),
       content: file.content,
     }));
-    const { writtenFiles } = await this.writeFiles(name, resolvedFiles);
-    const commandResult = await this.runCommand(name, {
-      args,
-      cwd: resolvedCwd,
-      env: input.env,
-      timeoutMs: input.timeoutMs,
-    });
-    return { writtenFiles, commandResult };
+    const { writtenFiles } =
+      resolvedFiles.length > 0 ? await this.writeFiles(name, resolvedFiles) : { writtenFiles: [] };
+
+    const editedFiles: FileEditResult[] = [];
+    for (const edit of edits) {
+      const editRes = await this.editFile(name, {
+        ...edit,
+        path: resolveSandboxPath(edit.path, resolvedCwd),
+      });
+      editedFiles.push(editRes);
+    }
+
+    const deletedFiles: string[] = [];
+    for (const delPath of deletes) {
+      const { removed } = await this.removeFile(
+        name,
+        resolveSandboxPath(delPath, resolvedCwd),
+        false,
+      );
+      deletedFiles.push(removed);
+    }
+
+    const commandResult = args
+      ? await this.runCommand(name, {
+          args,
+          cwd: resolvedCwd,
+          env: input.env,
+          timeoutMs: input.timeoutMs,
+        })
+      : undefined;
+
+    return { writtenFiles, editedFiles, deletedFiles, ...(commandResult ? { commandResult } : {}) };
   }
 
   async close(): Promise<void> {
