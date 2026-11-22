@@ -1,43 +1,56 @@
 import crypto from 'node:crypto';
-import type { NextFunction, Request, Response } from 'express';
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
+import type { IncomingMessage } from 'node:http';
+import { AuthProvider, DiskStore, OAuthProxy, type GoogleSession } from 'fastmcp/auth';
+import type { TokenStorage, UpstreamTokenSet } from 'fastmcp/auth';
+
+export const DEFAULT_GOOGLE_SCOPES = ['openid', 'email'];
+
+export const DEFAULT_ALLOWED_REDIRECT_URIS = [
+  'https://oauth-redirect.googleusercontent.com/r/*',
+  'https://oauth-redirect-sandbox.googleusercontent.com/r/*',
+  'https://oauth-redirect-test.googleusercontent.com/r/*',
+  'https://oauth-redirect.googleusercontent.com/a/*',
+  'https://oauth-redirect-sandbox.googleusercontent.com/a/*',
+  'https://oauth-redirect-test.googleusercontent.com/a/*',
+  'http://localhost:*',
+  'http://127.0.0.1:*',
+];
+
+const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
+const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+const GOOGLE_USERINFO_ENDPOINT = 'https://openidconnect.googleapis.com/v1/userinfo';
+const USERINFO_CACHE_TTL_MS = 60_000;
 
 export interface AuthConfig {
-  /** Optional static Bearer token for local/dev or simple proxy auth. */
-  bearerToken?: string;
-  /** Public base URL of this MCP server (e.g. https://sbx-mcp.example.com). */
+  /** Public HTTPS base URL of this MCP server (e.g. https://docker-sbx-mcp.6uo.me). */
   publicUrl?: string;
-  /** OIDC / OAuth 2.0 issuer URL (e.g. https://accounts.google.com). */
-  oauthIssuer?: string;
-  /** Expected JWT `aud` claim or Google OAuth Client ID (`*.apps.googleusercontent.com`). */
-  oauthAudience?: string;
-  /** Explicit JWKS URI override. If omitted, discovered via `${oauthIssuer}/.well-known/openid-configuration`. */
-  oauthJwksUri?: string;
-  /** Tokeninfo endpoint for opaque OAuth access tokens (auto-defaults to Google's tokeninfo when oauthIssuer is https://accounts.google.com). */
-  oauthTokenInfoUri?: string;
-  /** Optional allowlist of authorized `sub` claims. */
-  allowedSubjects?: string[];
-  /** Optional allowlist of authorized `email` claims (case-insensitive). */
+  /** Google OAuth 2.0 Web Client ID (GOOGLE_OAUTH_CLIENT_ID or OAUTH_AUDIENCE). */
+  googleClientId?: string;
+  /** Google OAuth 2.0 Web Client Secret (GOOGLE_OAUTH_CLIENT_SECRET). */
+  googleClientSecret?: string;
+  /** Comma-separated allowlist of verified Google email addresses (ALLOWED_EMAILS or OAUTH_ALLOWED_EMAILS). */
   allowedEmails?: string[];
-  /** Optional list of scopes that must all be present in the token's `scope` or `scp` claim. */
-  requiredScopes?: string[];
+  /** Allowed DCR client redirect URI glob patterns (ALLOWED_CLIENT_REDIRECT_URIS). */
+  allowedClientRedirectUris?: string[];
+  /** Optional explicit signing key for FastMCP JWTs and encrypted state (FASTMCP_JWT_SIGNING_KEY). */
+  jwtSigningKey?: string;
+  /** Optional directory for persistent encrypted DiskStore state (FASTMCP_STATE_DIR / FASTMCP_HOME). */
+  stateDir?: string;
+  /** Require browser consent screen before redirecting to Google (default: true). */
+  consentRequired?: boolean;
+  /** Optional static Bearer token fallback for local scripts or smoke tests (MCP_BEARER_TOKEN). */
+  bearerToken?: string;
+  /** Optional upstream endpoint overrides (primarily for testing). */
+  googleAuthorizationEndpoint?: string;
+  googleTokenEndpoint?: string;
+  googleUserInfoEndpoint?: string;
 }
 
-export interface VerifiedAuth {
-  mode: 'oauth-jwt' | 'oauth-opaque' | 'static-bearer';
-  subject?: string;
+export interface SandboxSession extends GoogleSession, Record<string, unknown> {
+  mode: 'google-oauth' | 'static-bearer';
   email?: string;
-  scopes: string[];
-  claims?: JWTPayload | Record<string, unknown>;
+  subject?: string;
 }
-
-export interface AuthenticatedRequest extends Request {
-  auth?: VerifiedAuth;
-}
-
-const GOOGLE_ISSUER = 'https://accounts.google.com';
-const GOOGLE_TOKENINFO_URI = 'https://oauth2.googleapis.com/tokeninfo';
-const OPAQUE_CACHE_MAX_TTL_MS = 60_000;
 
 export function parseCsvEnv(value?: string): string[] | undefined {
   if (!value) return undefined;
@@ -48,37 +61,38 @@ export function parseCsvEnv(value?: string): string[] | undefined {
   return items.length > 0 ? items : undefined;
 }
 
-export function authConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AuthConfig {
-  return {
-    bearerToken: env.MCP_BEARER_TOKEN,
-    publicUrl: env.PUBLIC_URL,
-    oauthIssuer: env.OAUTH_ISSUER,
-    oauthAudience: env.OAUTH_AUDIENCE,
-    oauthJwksUri: env.OAUTH_JWKS_URI,
-    oauthTokenInfoUri: env.OAUTH_TOKENINFO_URI,
-    allowedSubjects: parseCsvEnv(env.OAUTH_ALLOWED_SUBS),
-    allowedEmails: parseCsvEnv(env.OAUTH_ALLOWED_EMAILS),
-    requiredScopes: parseCsvEnv(env.OAUTH_REQUIRED_SCOPES),
-  };
+function parseBoolEnv(value?: string): boolean | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes') return true;
+  if (normalized === 'false' || normalized === '0' || normalized === 'no') return false;
+  return undefined;
 }
 
-/**
- * Resolves the public origin for RFC 9728 metadata and WWW-Authenticate headers.
- * Prefers PUBLIC_URL, falling back to X-Forwarded-Proto + Host (e.g. behind GoDoxy / Cloud Run).
- */
-export function resolvePublicOrigin(config: AuthConfig, req?: Request): string {
-  if (config.publicUrl) {
-    return config.publicUrl.replace(/\/$/, '');
-  }
-  if (req) {
-    const forwardedProto = req.header('x-forwarded-proto')?.split(',')[0]?.trim();
-    const proto = forwardedProto || req.protocol || 'https';
-    const host = req.header('x-forwarded-host')?.split(',')[0]?.trim() || req.header('host');
-    if (host) {
-      return `${proto}://${host}`;
-    }
-  }
-  return 'http://localhost:8080';
+export function authConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AuthConfig {
+  const publicUrl = env.PUBLIC_URL?.trim().replace(/\/$/, '') || undefined;
+  const googleClientId =
+    env.GOOGLE_OAUTH_CLIENT_ID?.trim() || env.OAUTH_AUDIENCE?.trim() || undefined;
+  const googleClientSecret = env.GOOGLE_OAUTH_CLIENT_SECRET?.trim() || undefined;
+  const allowedEmails = parseCsvEnv(env.ALLOWED_EMAILS ?? env.OAUTH_ALLOWED_EMAILS);
+  const allowedClientRedirectUris = parseCsvEnv(env.ALLOWED_CLIENT_REDIRECT_URIS);
+  const jwtSigningKey =
+    env.FASTMCP_JWT_SIGNING_KEY?.trim() || env.OAUTH_JWT_SIGNING_KEY?.trim() || undefined;
+  const stateDir = env.FASTMCP_STATE_DIR?.trim() || env.FASTMCP_HOME?.trim() || undefined;
+  const consentRequired = parseBoolEnv(env.OAUTH_CONSENT_REQUIRED);
+  const bearerToken = env.MCP_BEARER_TOKEN?.trim() || undefined;
+
+  return {
+    publicUrl,
+    googleClientId,
+    googleClientSecret,
+    allowedEmails,
+    allowedClientRedirectUris,
+    jwtSigningKey,
+    stateDir,
+    consentRequired,
+    bearerToken,
+  };
 }
 
 function constantTimeEquals(a: string, b: string): boolean {
@@ -88,325 +102,264 @@ function constantTimeEquals(a: string, b: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
-function isJwtFormat(token: string): boolean {
+function deriveKey(seed: string, purpose: string): string {
+  return crypto.createHmac('sha256', seed).update(`docker-sandbox-mcp:${purpose}`).digest('hex');
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
   const parts = token.split('.');
-  return parts.length === 3 && parts.every((p) => p.length > 0);
+  if (parts.length !== 3) return null;
+  try {
+    const raw = Buffer.from(parts[1], 'base64url').toString('utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
 }
 
-function extractScopes(payload: Record<string, unknown>): string[] {
-  const out = new Set<string>();
-  if (typeof payload.scope === 'string') {
-    for (const s of payload.scope.split(/\s+/)) {
-      if (s) out.add(s);
-    }
-  }
-  const scp = payload.scp;
-  if (Array.isArray(scp)) {
-    for (const s of scp) {
-      if (typeof s === 'string' && s) out.add(s);
-    }
-  } else if (typeof scp === 'string') {
-    for (const s of scp.split(/\s+/)) {
-      if (s) out.add(s);
-    }
-  }
-  return Array.from(out);
+function isEmailVerified(value: unknown): boolean {
+  return value === true || (typeof value === 'string' && value.trim().toLowerCase() === 'true');
 }
 
-function buildWwwAuthenticate(
-  config: AuthConfig,
-  req: Request,
-  error?: string,
-  description?: string,
-): string {
-  const origin = resolvePublicOrigin(config, req);
-  const parts = [
-    'Bearer realm="docker-sandbox-mcp"',
-    `resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
-  ];
-  if (error) parts.push(`error="${error}"`);
-  if (description) parts.push(`error_description="${description.replace(/"/g, "'")}"`);
-  return parts.join(', ');
+function forbiddenResponse(message: string): Response {
+  return new Response(JSON.stringify({ error: 'forbidden', message }), {
+    status: 403,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
-export interface TokenVerifier {
-  verify(token: string): Promise<VerifiedAuth>;
+function extractBearerToken(request?: IncomingMessage): string | undefined {
+  const raw = request?.headers?.authorization;
+  const header = Array.isArray(raw) ? raw[0] : raw;
+  if (!header) return undefined;
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match?.[1];
 }
 
-/**
- * Creates a verifier that handles both:
- * - Signed JWTs via OIDC JWKS discovery (`jose.jwtVerify`)
- * - Opaque OAuth 2.0 access tokens (such as Google Cloud OAuth `ya29.*` tokens) via
- *   the tokeninfo endpoint with short-lived in-memory caching.
- */
-export function createJwtVerifier(config: AuthConfig): TokenVerifier {
-  if (!config.oauthIssuer && !config.oauthJwksUri && !config.oauthTokenInfoUri) {
-    throw new Error(
-      'One of oauthIssuer, oauthJwksUri, or oauthTokenInfoUri is required for OAuth verification.',
-    );
+export interface GoogleIdentity {
+  email?: string;
+  emailVerified: boolean;
+  subject?: string;
+}
+
+export class SandboxGoogleProvider extends AuthProvider<SandboxSession> {
+  private readonly sandboxConfig: AuthConfig;
+  private readonly allowedEmails?: Set<string>;
+  private readonly userInfoEndpoint: string;
+  private readonly userInfoCache = new Map<string, { identity: GoogleIdentity; expiresAt: number }>();
+  private diskStore?: DiskStore;
+
+  constructor(config: AuthConfig) {
+    if (!config.publicUrl) {
+      throw new Error('PUBLIC_URL is required when Google OAuth proxy is enabled.');
+    }
+    if (!config.googleClientId || !config.googleClientSecret) {
+      throw new Error(
+        'Both GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET are required for Google OAuth proxy.',
+      );
+    }
+
+    const baseUrl = config.publicUrl.replace(/\/$/, '');
+    const keySeed = config.jwtSigningKey || config.googleClientSecret;
+    const allowedRedirectUriPatterns =
+      config.allowedClientRedirectUris ?? DEFAULT_ALLOWED_REDIRECT_URIS;
+
+    super({
+      baseUrl,
+      clientId: config.googleClientId,
+      clientSecret: config.googleClientSecret,
+      scopes: DEFAULT_GOOGLE_SCOPES,
+      consentRequired: config.consentRequired ?? true,
+      allowedRedirectUriPatterns,
+      allowPlainPkce: false,
+      authorizationResponseIss: true,
+      enableCimd: true,
+      jwtSigningKey: deriveKey(keySeed, 'jwt'),
+      encryptionKey: deriveKey(keySeed, 'encryption'),
+    });
+
+    this.sandboxConfig = config;
+    this.allowedEmails = config.allowedEmails
+      ? new Set(config.allowedEmails.map((e) => e.trim().toLowerCase()).filter(Boolean))
+      : undefined;
+    this.userInfoEndpoint = config.googleUserInfoEndpoint ?? GOOGLE_USERINFO_ENDPOINT;
   }
 
-  let jwksPromise: Promise<ReturnType<typeof createRemoteJWKSet>> | undefined;
-
-  async function getJwks(): Promise<ReturnType<typeof createRemoteJWKSet>> {
-    if (!jwksPromise) {
-      jwksPromise = (async () => {
-        if (config.oauthJwksUri) {
-          return createRemoteJWKSet(new URL(config.oauthJwksUri));
-        }
-        const issuerBase = config.oauthIssuer!.replace(/\/$/, '');
-        const discoveryUrl = `${issuerBase}/.well-known/openid-configuration`;
-        const res = await fetch(discoveryUrl, {
-          headers: { accept: 'application/json' },
-        });
-        if (!res.ok) {
-          throw new Error(`OIDC discovery failed (${res.status}) at ${discoveryUrl}`);
-        }
-        const doc = (await res.json()) as { jwks_uri?: string };
-        if (!doc.jwks_uri) {
-          throw new Error(`OIDC discovery document at ${discoveryUrl} is missing jwks_uri`);
-        }
-        return createRemoteJWKSet(new URL(doc.jwks_uri));
-      })().catch((err) => {
-        jwksPromise = undefined;
-        throw err;
-      });
-    }
-    return jwksPromise;
+  protected override getAuthorizationEndpoint(): string {
+    return this.sandboxConfig.googleAuthorizationEndpoint ?? GOOGLE_AUTH_ENDPOINT;
   }
 
-  const normalizedIssuer = config.oauthIssuer?.replace(/\/$/, '');
-  const tokenInfoUri =
-    config.oauthTokenInfoUri ??
-    (normalizedIssuer === GOOGLE_ISSUER ? GOOGLE_TOKENINFO_URI : undefined);
+  protected override getDefaultScopes(): string[] {
+    return DEFAULT_GOOGLE_SCOPES;
+  }
 
-  const opaqueCache = new Map<string, { auth: VerifiedAuth; expiresAt: number }>();
+  protected override getTokenEndpoint(): string {
+    return this.sandboxConfig.googleTokenEndpoint ?? GOOGLE_TOKEN_ENDPOINT;
+  }
 
-  const allowedSubs = config.allowedSubjects ? new Set(config.allowedSubjects) : undefined;
-  const allowedEmails = config.allowedEmails
-    ? new Set(config.allowedEmails.map((e) => e.toLowerCase()))
-    : undefined;
-
-  function enforcePolicy(
-    mode: 'oauth-jwt' | 'oauth-opaque',
-    subject: string | undefined,
-    email: string | undefined,
-    scopes: string[],
-    claims: Record<string, unknown>,
-  ): VerifiedAuth {
-    if (allowedSubs && (!subject || !allowedSubs.has(subject))) {
-      throw new AuthForbiddenError('Token subject is not authorized to access this MCP server.');
+  protected override createProxy(): OAuthProxy {
+    const keySeed = this.sandboxConfig.jwtSigningKey || this.sandboxConfig.googleClientSecret!;
+    let tokenStorage: TokenStorage | undefined;
+    if (this.sandboxConfig.stateDir) {
+      this.diskStore = new DiskStore({ directory: this.sandboxConfig.stateDir });
+      tokenStorage = this.diskStore;
     }
 
-    if (allowedEmails && (!email || !allowedEmails.has(email.toLowerCase()))) {
-      throw new AuthForbiddenError('Token email is not authorized to access this MCP server.');
-    }
+    return new OAuthProxy({
+      ...this.forwardedProxyOptions,
+      allowedRedirectUriPatterns:
+        this.sandboxConfig.allowedClientRedirectUris ?? DEFAULT_ALLOWED_REDIRECT_URIS,
+      baseUrl: this.sandboxConfig.publicUrl!.replace(/\/$/, ''),
+      consentRequired: this.sandboxConfig.consentRequired ?? true,
+      consentSigningKey: deriveKey(keySeed, 'consent'),
+      encryptionKey: deriveKey(keySeed, 'encryption'),
+      extraAuthorizationParams: {
+        access_type: 'offline',
+        prompt: 'consent',
+      },
+      jwtSigningKey: deriveKey(keySeed, 'jwt'),
+      scopes: DEFAULT_GOOGLE_SCOPES,
+      tokenStorage,
+      upstreamAuthorizationEndpoint:
+        this.sandboxConfig.googleAuthorizationEndpoint ?? GOOGLE_AUTH_ENDPOINT,
+      upstreamClientId: this.sandboxConfig.googleClientId!,
+      upstreamClientSecret: this.sandboxConfig.googleClientSecret!,
+      upstreamTokenEndpoint: this.sandboxConfig.googleTokenEndpoint ?? GOOGLE_TOKEN_ENDPOINT,
+    });
+  }
 
-    if (config.requiredScopes && config.requiredScopes.length > 0) {
-      const scopeSet = new Set(scopes);
-      const missing = config.requiredScopes.filter((s) => !scopeSet.has(s));
-      if (missing.length > 0) {
-        throw new AuthInsufficientScopeError(
-          `Missing required scope(s): ${missing.join(', ')}`,
-        );
+  private async resolveIdentity(upstreamTokens: UpstreamTokenSet): Promise<GoogleIdentity> {
+    if (upstreamTokens.idToken) {
+      const payload = decodeJwtPayload(upstreamTokens.idToken);
+      if (payload && typeof payload.email === 'string') {
+        return {
+          email: payload.email,
+          emailVerified: isEmailVerified(payload.email_verified),
+          subject: typeof payload.sub === 'string' ? payload.sub : undefined,
+        };
       }
     }
 
-    return { mode, subject, email, scopes, claims };
-  }
-
-  async function verifyOpaqueToken(token: string): Promise<VerifiedAuth> {
-    if (!tokenInfoUri) {
-      throw new Error('Token is not a JWT and no opaque tokeninfo endpoint is configured.');
-    }
-
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    const cached = opaqueCache.get(tokenHash);
+    const tokenHash = crypto
+      .createHash('sha256')
+      .update(upstreamTokens.accessToken)
+      .digest('hex');
     const now = Date.now();
+    const cached = this.userInfoCache.get(tokenHash);
     if (cached && cached.expiresAt > now) {
-      return cached.auth;
+      return cached.identity;
     }
 
-    const body = new URLSearchParams({ access_token: token });
-    const res = await fetch(tokenInfoUri, {
-      method: 'POST',
+    const res = await fetch(this.userInfoEndpoint, {
       headers: {
-        'content-type': 'application/x-www-form-urlencoded',
+        authorization: `Bearer ${upstreamTokens.accessToken}`,
         accept: 'application/json',
       },
-      body: body.toString(),
     });
-
     if (!res.ok) {
-      throw new Error(`Token introspection rejected the access token (${res.status}).`);
+      throw new Error(`Failed to fetch Google userinfo (${res.status}).`);
     }
-
     const info = (await res.json()) as Record<string, unknown>;
-
-    if (config.oauthAudience) {
-      const aud = typeof info.aud === 'string' ? info.aud : undefined;
-      const azp = typeof info.azp === 'string' ? info.azp : undefined;
-      if (aud !== config.oauthAudience && azp !== config.oauthAudience) {
-        throw new Error('Access token audience does not match OAUTH_AUDIENCE.');
-      }
-    }
-
-    if (info.email && info.email_verified !== undefined) {
-      const verified = info.email_verified === true || info.email_verified === 'true';
-      if (!verified) {
-        throw new Error('Access token email is not verified.');
-      }
-    }
-
-    const expSec = typeof info.exp === 'string' ? Number(info.exp) : Number(info.exp ?? 0);
-    if (expSec > 0 && expSec * 1000 <= now) {
-      throw new Error('Access token is expired.');
-    }
-
-    const subject = typeof info.sub === 'string' ? info.sub : undefined;
-    const email = typeof info.email === 'string' ? info.email : undefined;
-    const scopes = extractScopes(info);
-    const verified = enforcePolicy('oauth-opaque', subject, email, scopes, info);
-
-    const tokenExpMs = expSec > 0 ? expSec * 1000 : now + OPAQUE_CACHE_MAX_TTL_MS;
-    const cacheUntil = Math.min(tokenExpMs, now + OPAQUE_CACHE_MAX_TTL_MS);
-    opaqueCache.set(tokenHash, { auth: verified, expiresAt: cacheUntil });
-    return verified;
-  }
-
-  return {
-    async verify(token: string): Promise<VerifiedAuth> {
-      if (!isJwtFormat(token)) {
-        return verifyOpaqueToken(token);
-      }
-
-      const jwks = await getJwks();
-      const { payload } = await jwtVerify(token, jwks, {
-        ...(config.oauthIssuer ? { issuer: config.oauthIssuer } : {}),
-        ...(config.oauthAudience ? { audience: config.oauthAudience } : {}),
-      });
-
-      const subject = typeof payload.sub === 'string' ? payload.sub : undefined;
-      const email = typeof payload.email === 'string' ? payload.email : undefined;
-      const scopes = extractScopes(payload as Record<string, unknown>);
-      return enforcePolicy('oauth-jwt', subject, email, scopes, payload as Record<string, unknown>);
-    },
-  };
-}
-
-class AuthForbiddenError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'AuthForbiddenError';
-  }
-}
-
-class AuthInsufficientScopeError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'AuthInsufficientScopeError';
-  }
-}
-
-/**
- * Express authentication middleware supporting:
- * 1. OAuth 2.0 / OIDC JWT verification via JWKS (`OAUTH_ISSUER` / `OAUTH_JWKS_URI`).
- * 2. Opaque OAuth 2.0 access tokens (e.g., Google Cloud OAuth `ya29.*` tokens via tokeninfo).
- * 3. Static Bearer token verification (`MCP_BEARER_TOKEN`) as an optional fallback.
- */
-export function createAuthMiddleware(config: AuthConfig) {
-  const oauthEnabled = Boolean(
-    config.oauthIssuer || config.oauthJwksUri || config.oauthTokenInfoUri,
-  );
-  const staticEnabled = Boolean(config.bearerToken);
-  const verifier = oauthEnabled ? createJwtVerifier(config) : undefined;
-
-  return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
-    if (!oauthEnabled && !staticEnabled) {
-      next();
-      return;
-    }
-
-    const header = req.header('authorization') ?? '';
-    const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-    if (!match) {
-      res.setHeader('WWW-Authenticate', buildWwwAuthenticate(config, req));
-      res.status(401).json({
-        error: 'unauthorized',
-        message: 'OAuth 2.0 Bearer access token required.',
-      });
-      return;
-    }
-
-    const token = match[1];
-
-    if (staticEnabled && config.bearerToken && constantTimeEquals(token, config.bearerToken)) {
-      req.auth = { mode: 'static-bearer', scopes: [] };
-      next();
-      return;
-    }
-
-    if (verifier) {
-      try {
-        req.auth = await verifier.verify(token);
-        next();
-        return;
-      } catch (err) {
-        if (err instanceof AuthInsufficientScopeError) {
-          res.setHeader(
-            'WWW-Authenticate',
-            buildWwwAuthenticate(config, req, 'insufficient_scope', err.message),
-          );
-          res.status(403).json({
-            error: 'insufficient_scope',
-            message: err.message,
-          });
-          return;
-        }
-        if (err instanceof AuthForbiddenError) {
-          res.status(403).json({
-            error: 'forbidden',
-            message: err.message,
-          });
-          return;
-        }
-        const detail = err instanceof Error ? err.message : 'Invalid token';
-        res.setHeader(
-          'WWW-Authenticate',
-          buildWwwAuthenticate(config, req, 'invalid_token', detail),
-        );
-        res.status(401).json({
-          error: 'invalid_token',
-          message: 'Bearer token verification failed.',
-        });
-        return;
-      }
-    }
-
-    res.setHeader('WWW-Authenticate', buildWwwAuthenticate(config, req, 'invalid_token'));
-    res.status(401).json({
-      error: 'unauthorized',
-      message: 'Invalid Bearer token.',
+    const identity: GoogleIdentity = {
+      email: typeof info.email === 'string' ? info.email : undefined,
+      emailVerified: isEmailVerified(info.email_verified),
+      subject: typeof info.sub === 'string' ? info.sub : undefined,
+    };
+    this.userInfoCache.set(tokenHash, {
+      identity,
+      expiresAt: now + USERINFO_CACHE_TTL_MS,
     });
+    return identity;
+  }
+
+  override async authenticate(
+    request: IncomingMessage | undefined,
+  ): Promise<SandboxSession | undefined> {
+    if (!request) {
+      return undefined;
+    }
+
+    const token = extractBearerToken(request);
+    if (!token) {
+      return undefined;
+    }
+
+    if (
+      this.sandboxConfig.bearerToken &&
+      constantTimeEquals(token, this.sandboxConfig.bearerToken)
+    ) {
+      return {
+        mode: 'static-bearer',
+        accessToken: token,
+        scopes: [],
+      };
+    }
+
+    const upstreamTokens = await this.proxy.loadUpstreamTokens(token);
+    if (!upstreamTokens) {
+      return undefined;
+    }
+
+    const baseSession = this.createSession(upstreamTokens);
+    let identity: GoogleIdentity | undefined;
+
+    if (this.allowedEmails && this.allowedEmails.size > 0) {
+      try {
+        identity = await this.resolveIdentity(upstreamTokens);
+      } catch {
+        return undefined;
+      }
+
+      if (!identity.emailVerified) {
+        throw forbiddenResponse('A verified Google email address is required.');
+      }
+      if (!identity.email || !this.allowedEmails.has(identity.email.trim().toLowerCase())) {
+        throw forbiddenResponse('Authenticated Google account is not authorized for this server.');
+      }
+    } else if (upstreamTokens.idToken) {
+      const payload = decodeJwtPayload(upstreamTokens.idToken);
+      if (payload) {
+        identity = {
+          email: typeof payload.email === 'string' ? payload.email : undefined,
+          emailVerified: isEmailVerified(payload.email_verified),
+          subject: typeof payload.sub === 'string' ? payload.sub : undefined,
+        };
+      }
+    }
+
+    return {
+      ...baseSession,
+      mode: 'google-oauth',
+      email: identity?.email,
+      subject: identity?.subject,
+      scopes: baseSession.scopes ?? [],
+    };
+  }
+
+  destroy(): void {
+    this.getProxy().destroy();
+    this.diskStore?.destroy();
+    this.userInfoCache.clear();
+  }
+}
+
+export function createStaticBearerAuthenticate(
+  bearerToken: string,
+): (request: IncomingMessage) => Promise<SandboxSession | undefined> {
+  return async (request: IncomingMessage): Promise<SandboxSession | undefined> => {
+    const token = extractBearerToken(request);
+    if (!token || !constantTimeEquals(token, bearerToken)) {
+      return undefined;
+    }
+    return {
+      mode: 'static-bearer',
+      accessToken: token,
+      scopes: [],
+    };
   };
 }
 
-/**
- * RFC 9728 OAuth 2.0 Protected Resource Metadata document for MCP clients
- * (including Gemini Web Connected Apps).
- */
-export function buildProtectedResourceMetadata(
-  config: AuthConfig,
-  req?: Request,
-): Record<string, unknown> {
-  const origin = resolvePublicOrigin(config, req);
-  return {
-    resource: `${origin}/mcp`,
-    ...(config.oauthIssuer ? { authorization_servers: [config.oauthIssuer] } : {}),
-    bearer_methods_supported: ['header'],
-    scopes_supported:
-      config.requiredScopes && config.requiredScopes.length > 0
-        ? config.requiredScopes
-        : ['openid', 'email', 'profile'],
-  };
+export function isGoogleOAuthConfigured(config: AuthConfig): boolean {
+  return Boolean(config.googleClientId || config.googleClientSecret);
 }

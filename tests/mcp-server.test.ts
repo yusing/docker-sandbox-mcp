@@ -1,11 +1,8 @@
-import { webcrypto } from 'node:crypto';
-if (!globalThis.crypto) Object.defineProperty(globalThis, 'crypto', { value: webcrypto });
 import assert from 'node:assert/strict';
-import http from 'node:http';
+import net from 'node:net';
 import { describe, it } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { createHttpApp } from '../src/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { createSandboxMcpServer } from '../src/mcp-server.js';
 import {
   createDockerAuthenticator,
@@ -21,6 +18,16 @@ import {
   type SandboxService,
   type SandboxSummary,
 } from '../src/sandbox-service.js';
+
+async function getFreePort(): Promise<number> {
+  const srv = net.createServer();
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const addr = srv.address();
+  assert(addr && typeof addr !== 'string');
+  const { port } = addr;
+  await new Promise<void>((resolve) => srv.close(() => resolve()));
+  return port;
+}
 
 class MockSandboxService implements SandboxService {
   private counter = 0;
@@ -152,143 +159,123 @@ class MockSandboxService implements SandboxService {
   async close(): Promise<void> {}
 }
 
-describe('docker-sandbox-mcp tools', () => {
-  it('exposes all tools with proper readOnlyHint annotations and executes full lifecycle', async () => {
+describe('docker-sandbox-mcp tools & HTTP transport', () => {
+  it('exposes all tools with proper annotations, enforces static Bearer auth, and executes full lifecycle', async () => {
     const service = new MockSandboxService();
-    const server = createSandboxMcpServer(service);
-    const client = new Client({ name: 'test-client', version: '0.1.0' });
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-
-    const listed = await client.listTools();
-    const toolMap = new Map(listed.tools.map((t) => [t.name, t]));
-    assert.equal(toolMap.get('list_sandboxes')?.annotations?.readOnlyHint, true);
-    assert.equal(toolMap.get('get_sandbox')?.annotations?.readOnlyHint, true);
-    assert.equal(toolMap.get('read_file')?.annotations?.readOnlyHint, true);
-    assert.equal(toolMap.get('list_files')?.annotations?.readOnlyHint, true);
-    assert.equal(toolMap.get('get_process_output')?.annotations?.readOnlyHint, true);
-    assert.equal(toolMap.get('apply_and_run')?.annotations?.readOnlyHint, false);
-    assert.equal(toolMap.get('delete_sandbox')?.annotations?.destructiveHint, true);
-
-    const createdRes = await client.callTool({
-      name: 'create_sandbox',
-      arguments: { kit: 'shell', displayName: 'ci-test' },
-    });
-    const created = JSON.parse((createdRes.content as Array<{ text: string }>)[0].text);
-    assert.equal(created.name, 'sandboxes/sbx-1');
-    assert.equal(created.status, 'RUNNING');
-
-    const applyRes = await client.callTool({
-      name: 'apply_and_run',
-      arguments: {
-        sandboxName: created.name,
-        files: [{ path: '/workspace/hello.txt', content: 'hello world' }],
-        args: ['sh', '-c', 'cat /workspace/hello.txt'],
-      },
-    });
-    const applied = JSON.parse((applyRes.content as Array<{ text: string }>)[0].text);
-    assert.deepEqual(applied.writtenFiles, ['/workspace/hello.txt']);
-    assert.equal(applied.exitCode, 0);
-    assert.match(applied.stdout, /ran: sh -c cat \/workspace\/hello.txt/);
-
-    const readRes = await client.callTool({
-      name: 'read_file',
-      arguments: { sandboxName: created.name, path: '/workspace/hello.txt' },
-    });
-    assert.equal((readRes.content as Array<{ text: string }>)[0].text, 'hello world');
-
-    const bgRes = await client.callTool({
-      name: 'start_background_process',
-      arguments: { sandboxName: created.name, args: ['node', 'server.js'] },
-    });
-    const bg = JSON.parse((bgRes.content as Array<{ text: string }>)[0].text);
-    const outRes = await client.callTool({
-      name: 'get_process_output',
-      arguments: { sandboxName: created.name, processName: bg.name },
-    });
-    const out = JSON.parse((outRes.content as Array<{ text: string }>)[0].text);
-    assert.match(out.output, /server listening/);
-
-    await client.callTool({ name: 'stop_sandbox', arguments: { sandboxName: created.name } });
-    const stopped = JSON.parse(
-      ((await client.callTool({ name: 'get_sandbox', arguments: { sandboxName: created.name } }))
-        .content as Array<{ text: string }>)[0].text,
-    );
-    assert.equal(stopped.status, 'STOPPED');
-
-    await client.callTool({ name: 'delete_sandbox', arguments: { sandboxName: created.name } });
-    const afterDelete = JSON.parse(
-      ((await client.callTool({ name: 'list_sandboxes', arguments: {} }))
-        .content as Array<{ text: string }>)[0].text,
-    );
-    assert.equal(afterDelete.sandboxes.length, 0);
-
-    await Promise.all([client.close(), server.close()]);
-  });
-
-  it('throws clear error when Docker credentials are missing', () => {
-    assert.throws(() => createDockerAuthenticator({}), /Docker Sandboxes credentials missing/);
-  });
-});
-
-describe('HTTP Streamable transport & auth', () => {
-  it('serves /healthz, /.well-known/oauth-protected-resource, and enforces Bearer auth on /mcp', async () => {
-    const service = new MockSandboxService();
-    const app = createHttpApp({
+    const port = await getFreePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const handle = createSandboxMcpServer({
       service,
-      auth: {
-        bearerToken: 'test-secret-token',
-        publicUrl: 'https://mcp.example.com',
-        oauthIssuer: 'https://accounts.google.com',
+      auth: { bearerToken: 'test-secret-token' },
+    });
+
+    await handle.server.start({
+      transportType: 'httpStream',
+      httpStream: {
+        host: '127.0.0.1',
+        port,
+        endpoint: '/mcp',
+        sseEndpoint: null,
+        stateless: true,
       },
     });
 
-    const server = http.createServer(app);
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    assert(address && typeof address !== 'string');
-    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const client = new Client({ name: 'test-client', version: '0.1.0' });
+    const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
+      requestInit: {
+        headers: {
+          authorization: 'Bearer test-secret-token',
+        },
+      },
+    });
 
     try {
       const health = await fetch(`${baseUrl}/healthz`);
       assert.equal(health.status, 200);
 
-      const meta = await fetch(`${baseUrl}/.well-known/oauth-protected-resource`);
-      assert.equal(meta.status, 200);
-      const metaJson = (await meta.json()) as Record<string, unknown>;
-      assert.equal(metaJson.resource, 'https://mcp.example.com/mcp');
-
       const unauth = await fetch(`${baseUrl}/mcp`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+        },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
       });
       assert.equal(unauth.status, 401);
       assert.match(unauth.headers.get('www-authenticate') ?? '', /Bearer/);
 
-      const authed = await fetch(`${baseUrl}/mcp`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json, text/event-stream',
-          authorization: 'Bearer test-secret-token',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'initialize',
-          params: {
-            protocolVersion: '2025-03-26',
-            capabilities: {},
-            clientInfo: { name: 'test', version: '1.0.0' },
-          },
-        }),
+      await client.connect(transport);
+
+      const listed = await client.listTools();
+      const toolMap = new Map(listed.tools.map((t) => [t.name, t]));
+      assert.equal(toolMap.get('list_sandboxes')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('get_sandbox')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('read_file')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('list_files')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('get_process_output')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('apply_and_run')?.annotations?.readOnlyHint, false);
+      assert.equal(toolMap.get('delete_sandbox')?.annotations?.destructiveHint, true);
+
+      const createdRes = await client.callTool({
+        name: 'create_sandbox',
+        arguments: { kit: 'shell', displayName: 'ci-test' },
       });
-      const authedBody = await authed.text();
-      assert.equal(authed.status, 200, authedBody);
+      const created = JSON.parse((createdRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(created.name, 'sandboxes/sbx-1');
+      assert.equal(created.status, 'RUNNING');
+
+      const applyRes = await client.callTool({
+        name: 'apply_and_run',
+        arguments: {
+          sandboxName: created.name,
+          files: [{ path: '/workspace/hello.txt', content: 'hello world' }],
+          args: ['sh', '-c', 'cat /workspace/hello.txt'],
+        },
+      });
+      const applied = JSON.parse((applyRes.content as Array<{ text: string }>)[0].text);
+      assert.deepEqual(applied.writtenFiles, ['/workspace/hello.txt']);
+      assert.equal(applied.exitCode, 0);
+      assert.match(applied.stdout, /ran: sh -c cat \/workspace\/hello.txt/);
+
+      const readRes = await client.callTool({
+        name: 'read_file',
+        arguments: { sandboxName: created.name, path: '/workspace/hello.txt' },
+      });
+      assert.equal((readRes.content as Array<{ text: string }>)[0].text, 'hello world');
+
+      const bgRes = await client.callTool({
+        name: 'start_background_process',
+        arguments: { sandboxName: created.name, args: ['node', 'server.js'] },
+      });
+      const bg = JSON.parse((bgRes.content as Array<{ text: string }>)[0].text);
+      const outRes = await client.callTool({
+        name: 'get_process_output',
+        arguments: { sandboxName: created.name, processName: bg.name },
+      });
+      const out = JSON.parse((outRes.content as Array<{ text: string }>)[0].text);
+      assert.match(out.output, /server listening/);
+
+      await client.callTool({ name: 'stop_sandbox', arguments: { sandboxName: created.name } });
+      const stopped = JSON.parse(
+        ((await client.callTool({ name: 'get_sandbox', arguments: { sandboxName: created.name } }))
+          .content as Array<{ text: string }>)[0].text,
+      );
+      assert.equal(stopped.status, 'STOPPED');
+
+      await client.callTool({ name: 'delete_sandbox', arguments: { sandboxName: created.name } });
+      const afterDelete = JSON.parse(
+        ((await client.callTool({ name: 'list_sandboxes', arguments: {} }))
+          .content as Array<{ text: string }>)[0].text,
+      );
+      assert.equal(afterDelete.sandboxes.length, 0);
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await client.close();
+      await handle.server.stop();
+      handle.destroy();
     }
+  });
+
+  it('throws clear error when Docker credentials are missing', () => {
+    assert.throws(() => createDockerAuthenticator({}), /Docker Sandboxes credentials missing/);
   });
 });

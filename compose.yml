@@ -7,10 +7,13 @@ services:
     environment:
       PORT: 8080
       MCP_TRANSPORT: http
+      FASTMCP_STATE_DIR: /var/lib/fastmcp
+    volumes:
+      - fastmcp_state:/var/lib/fastmcp
     # Expose via GoDoxy (https://github.com/yusing/godoxy)
     # Accessible at https://<proxy.aliases>.<your-domain>/mcp
     labels:
-      proxy.aliases: sbx-mcp
+      proxy.aliases: docker-sbx-mcp
       proxy.#1.port: 8080
       # Optional: let GoDoxy pause the container when idle and wake on traffic
       # proxy.#1.idle_timeout: 10m
@@ -20,3 +23,20 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: [tunnel, --no-autoupdate, run]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Set the private Cloudflare Tunnel connector token}
+    depends_on:
+      - docker-sandbox-mcp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    labels:
+      proxy.exclude: all
+
+volumes:
+  fastmcp_state:
