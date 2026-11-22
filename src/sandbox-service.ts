@@ -45,6 +45,13 @@ export interface CommandResult {
   processName?: string;
 }
 
+export type ProcessSignal = 'term' | 'kill' | 'int' | 'hup' | 'quit' | 'usr1' | 'usr2';
+
+export interface GetProcessOutputOptions {
+  resumeFrom?: string | number;
+  maxBytes?: number;
+}
+
 export interface ProcessSummary {
   name: string;
   status: string;
@@ -55,6 +62,7 @@ export interface ProcessSummary {
 export interface ProcessOutputResult {
   process: ProcessSummary;
   output: string;
+  nextResumeFrom?: string;
 }
 
 export interface FileEntry {
@@ -275,7 +283,13 @@ export interface SandboxService {
   deleteSandbox(name: string, force?: boolean): Promise<{ deleted: string }>;
   runCommand(name: string, input: RunCommandInput): Promise<CommandResult>;
   startProcess(name: string, input: RunCommandInput): Promise<ProcessSummary>;
-  getProcessOutput(name: string, processName: string): Promise<ProcessOutputResult>;
+  getProcessOutput(
+    name: string,
+    processName: string,
+    options?: GetProcessOutputOptions,
+  ): Promise<ProcessOutputResult>;
+  listProcesses(name: string): Promise<ProcessSummary[]>;
+  stopProcess(name: string, processName: string, signal?: ProcessSignal): Promise<ProcessSummary>;
   writeFiles(name: string, files: FileWriteInput[]): Promise<{ writtenFiles: string[] }>;
   editFile(name: string, input: FileEditInput): Promise<FileEditResult>;
   readFile(name: string, path: string, maxBytes?: number): Promise<string>;
@@ -466,13 +480,30 @@ export class DockerSandboxService implements SandboxService {
     };
   }
 
-  async getProcessOutput(name: string, processName: string): Promise<ProcessOutputResult> {
+  async getProcessOutput(
+    name: string,
+    processName: string,
+    options: GetProcessOutputOptions = {},
+  ): Promise<ProcessOutputResult> {
     const sandbox = await this.client.get(name);
     const proc = await sandbox.processes.get(processName);
     const refreshed = await proc.refresh();
-    const outputRes = await refreshed.readOutput();
-    const chunks = (outputRes as { chunks?: Array<{ data?: string }> }).chunks ?? [];
-    const output = chunks.map((c) => c.data ?? '').join('');
+    const readInput = {
+      ...(options.resumeFrom !== undefined ? { resumeFrom: options.resumeFrom } : {}),
+      ...(options.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}),
+    };
+    const outputRes = await refreshed.readOutput(readInput);
+    const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+    const chunks =
+      (outputRes as { chunks?: Array<{ data?: Uint8Array | string }> }).chunks ?? [];
+    const output = chunks
+      .map((c) => {
+        if (!c.data) return '';
+        return typeof c.data === 'string' ? c.data : decoder.decode(c.data, { stream: true });
+      })
+      .join('') + decoder.decode();
+    const nextResumeFrom =
+      outputRes.nextResumeFrom !== undefined ? String(outputRes.nextResumeFrom) : undefined;
     return {
       process: {
         name: refreshed.name,
@@ -481,6 +512,38 @@ export class DockerSandboxService implements SandboxService {
         pid: refreshed.pid,
       },
       output,
+      ...(nextResumeFrom !== undefined ? { nextResumeFrom } : {}),
+    };
+  }
+
+  async listProcesses(name: string): Promise<ProcessSummary[]> {
+    const sandbox = await this.client.get(name);
+    const processes: ProcessSummary[] = [];
+    for await (const proc of sandbox.processes.all()) {
+      processes.push({
+        name: proc.name,
+        status: proc.status,
+        exitCode: proc.exitCode ?? undefined,
+        pid: proc.pid,
+      });
+    }
+    return processes;
+  }
+
+  async stopProcess(
+    name: string,
+    processName: string,
+    signal: ProcessSignal = 'term',
+  ): Promise<ProcessSummary> {
+    const sandbox = await this.client.get(name);
+    const proc = await sandbox.processes.get(processName);
+    await proc.signal(signal);
+    const refreshed = await proc.refresh();
+    return {
+      name: refreshed.name,
+      status: refreshed.status,
+      exitCode: refreshed.exitCode ?? undefined,
+      pid: refreshed.pid,
     };
   }
 

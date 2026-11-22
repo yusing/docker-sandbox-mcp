@@ -3,7 +3,12 @@ import net from 'node:net';
 import { describe, it } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { createSandboxMcpServer, formatFileLines } from '../src/mcp-server.js';
+import {
+  createSandboxMcpServer,
+  formatFileLines,
+  truncateHeadTail,
+  truncateTail,
+} from '../src/mcp-server.js';
 import {
   DEFAULT_WORKSPACE,
   applyTextEdit,
@@ -20,10 +25,12 @@ import {
   type FileEntry,
   type FileStatResult,
   type FileWriteInput,
+  type GetProcessOutputOptions,
   type GlobFilesInput,
   type GlobFilesResult,
   type ListFilesOptions,
   type ProcessOutputResult,
+  type ProcessSignal,
   type ProcessSummary,
   type RunCommandInput,
   type SandboxService,
@@ -134,11 +141,38 @@ class MockSandboxService implements SandboxService {
     return summary;
   }
 
-  async getProcessOutput(name: string, processName: string): Promise<ProcessOutputResult> {
+  async getProcessOutput(
+    name: string,
+    processName: string,
+    options: GetProcessOutputOptions = {},
+  ): Promise<ProcessOutputResult> {
     await this.getSandbox(name);
     const proc = this.processes.get(name)?.get(processName);
     if (!proc) throw new Error(`Process not found: ${processName}`);
-    return proc;
+    const offset = options.resumeFrom !== undefined ? Number(options.resumeFrom) : 0;
+    const output = Number.isFinite(offset) && offset > 0 ? proc.output.slice(offset) : proc.output;
+    return {
+      process: proc.process,
+      output,
+      nextResumeFrom: String(proc.output.length),
+    };
+  }
+
+  async listProcesses(name: string): Promise<ProcessSummary[]> {
+    await this.getSandbox(name);
+    return Array.from(this.processes.get(name)?.values() ?? []).map((entry) => entry.process);
+  }
+
+  async stopProcess(
+    name: string,
+    processName: string,
+    _signal: ProcessSignal = 'term',
+  ): Promise<ProcessSummary> {
+    await this.getSandbox(name);
+    const entry = this.processes.get(name)?.get(processName);
+    if (!entry) throw new Error(`Process not found: ${processName}`);
+    entry.process = { ...entry.process, status: 'EXITED', exitCode: 143 };
+    return entry.process;
   }
 
   async writeFiles(name: string, files: FileWriteInput[]): Promise<{ writtenFiles: string[] }> {
@@ -376,6 +410,8 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       assert.equal(toolMap.get('search_files')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('stat_file')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('get_process_output')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('list_processes')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('stop_process')?.annotations?.readOnlyHint, false);
       assert.equal(toolMap.get('apply_and_run')?.annotations?.readOnlyHint, false);
       assert.equal(toolMap.get('edit_file')?.annotations?.readOnlyHint, false);
       assert.equal(toolMap.get('remove_file')?.annotations?.destructiveHint, true);
@@ -546,6 +582,34 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       });
       const out = JSON.parse((outRes.content as Array<{ text: string }>)[0].text);
       assert.match(out.output, /server listening/);
+      assert.ok(out.nextResumeFrom);
+
+      const incrementalRes = await client.callTool({
+        name: 'get_process_output',
+        arguments: {
+          sandboxName: created.name,
+          processName: bg.name,
+          resumeFrom: out.nextResumeFrom,
+        },
+      });
+      const incremental = JSON.parse((incrementalRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(incremental.output, '');
+
+      const listProcsRes = await client.callTool({
+        name: 'list_processes',
+        arguments: { sandboxName: created.name },
+      });
+      const listProcs = JSON.parse((listProcsRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(listProcs.processes.length, 1);
+      assert.equal(listProcs.processes[0].name, bg.name);
+
+      const stopProcRes = await client.callTool({
+        name: 'stop_process',
+        arguments: { sandboxName: created.name, processName: bg.name, signal: 'term' },
+      });
+      const stoppedProc = JSON.parse((stopProcRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(stoppedProc.status, 'EXITED');
+      assert.equal(stoppedProc.exitCode, 143);
 
       await client.callTool({ name: 'stop_sandbox', arguments: { sandboxName: created.name } });
       const stopped = JSON.parse(
@@ -621,6 +685,20 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       () => applyTextEdit('hello', { oldText: 'missing', newText: 'x' }),
       /not found/,
     );
+  });
+
+  it('preserves head+tail for command output and tail for process logs', () => {
+    const long = `START_${'x'.repeat(100)}_END`;
+    const ht = truncateHeadTail(long, 40, 0.25);
+    assert.ok(ht.startsWith('START_'));
+    assert.ok(ht.endsWith('_END'));
+    assert.match(ht, /truncated \d+ characters in the middle/);
+
+    const tail = truncateTail(long, 20);
+    assert.ok(tail.endsWith('_END'));
+    assert.match(tail, /truncated \d+ leading characters/);
+    assert.equal(truncateHeadTail('short', 40), 'short');
+    assert.equal(truncateTail('short', 40), 'short');
   });
 
   it('throws clear error when Docker credentials are missing', () => {

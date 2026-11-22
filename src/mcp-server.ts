@@ -66,6 +66,24 @@ function truncateOutput(text: string, limit = MAX_OUTPUT_CHARS): string {
   return `${text.slice(0, limit)}\n\n...[truncated ${omitted} characters]`;
 }
 
+export function truncateHeadTail(
+  text: string,
+  limit = MAX_OUTPUT_CHARS,
+  headRatio = 0.25,
+): string {
+  if (text.length <= limit) return text;
+  const headLen = Math.floor(limit * headRatio);
+  const tailLen = limit - headLen;
+  const omitted = text.length - limit;
+  return `${text.slice(0, headLen)}\n\n...[truncated ${omitted} characters in the middle]...\n\n${text.slice(text.length - tailLen)}`;
+}
+
+export function truncateTail(text: string, limit = MAX_OUTPUT_CHARS): string {
+  if (text.length <= limit) return text;
+  const omitted = text.length - limit;
+  return `...[truncated ${omitted} leading characters]\n\n${text.slice(text.length - limit)}`;
+}
+
 function jsonText(payload: unknown): ContentResult {
   return {
     content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
@@ -317,8 +335,8 @@ export function createSandboxMcpServer({
             ? {
                 exitCode: res.commandResult.exitCode,
                 incomplete: res.commandResult.incomplete,
-                stdout: truncateOutput(res.commandResult.stdout),
-                stderr: truncateOutput(res.commandResult.stderr),
+                stdout: truncateHeadTail(res.commandResult.stdout),
+                stderr: truncateHeadTail(res.commandResult.stderr),
               }
             : {}),
         });
@@ -380,8 +398,8 @@ export function createSandboxMcpServer({
           exitCode: res.exitCode,
           incomplete: res.incomplete,
           processName: res.processName,
-          stdout: truncateOutput(res.stdout),
-          stderr: truncateOutput(res.stderr),
+          stdout: truncateHeadTail(res.stdout),
+          stderr: truncateHeadTail(res.stderr),
         });
       } catch (err) {
         return errorText(err);
@@ -437,13 +455,33 @@ export function createSandboxMcpServer({
 
   server.addTool({
     name: 'get_process_output',
-    description: 'Read status and buffered output of a background process in a sandbox.',
+    description:
+      'Read status and buffered output of a background process in a sandbox. Pass resumeFrom (from a previous nextResumeFrom) to poll incrementally; long output keeps the tail.',
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
       processName: z
         .string()
         .min(1)
         .describe('Resource name of the process returned by start_background_process.'),
+      resumeFrom: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Cursor from a previous get_process_output response (nextResumeFrom) to fetch only new output.'),
+      maxBytes: z
+        .number()
+        .int()
+        .positive()
+        .max(1024 * 1024)
+        .optional()
+        .describe('Optional maximum bytes to read from the process stream.'),
+      tailChars: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_OUTPUT_CHARS)
+        .optional()
+        .describe(`Maximum trailing characters to return (default: ${MAX_OUTPUT_CHARS}).`),
     }),
     annotations: {
       title: 'Get Process Output',
@@ -451,13 +489,71 @@ export function createSandboxMcpServer({
       idempotentHint: true,
       openWorldHint: false,
     },
-    execute: async ({ sandboxName, processName }) => {
+    execute: async ({ sandboxName, processName, resumeFrom, maxBytes, tailChars }) => {
       try {
-        const res = await service.getProcessOutput(sandboxName, processName);
+        const res = await service.getProcessOutput(sandboxName, processName, {
+          resumeFrom,
+          maxBytes,
+        });
         return jsonText({
           process: res.process,
-          output: truncateOutput(res.output),
+          output: truncateTail(res.output, tailChars ?? MAX_OUTPUT_CHARS),
+          ...(res.nextResumeFrom !== undefined ? { nextResumeFrom: res.nextResumeFrom } : {}),
         });
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'list_processes',
+    description: 'List processes running or recorded inside a Docker Cloud Sandbox.',
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+    }),
+    annotations: {
+      title: 'List Processes',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName }) => {
+      try {
+        const processes = await service.listProcesses(sandboxName);
+        return jsonText({ processes });
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'stop_process',
+    description:
+      'Send a signal (default: "term") to stop a background or hung process inside a Docker Cloud Sandbox.',
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+      processName: z
+        .string()
+        .min(1)
+        .describe('Resource name of the process returned by start_background_process or list_processes.'),
+      signal: z
+        .enum(['term', 'kill', 'int', 'hup', 'quit', 'usr1', 'usr2'])
+        .default('term')
+        .describe('POSIX signal to send to the process (default: "term").'),
+    }),
+    annotations: {
+      title: 'Stop Process',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName, processName, signal }) => {
+      try {
+        const proc = await service.stopProcess(sandboxName, processName, signal);
+        return jsonText(proc);
       } catch (err) {
         return errorText(err);
       }
