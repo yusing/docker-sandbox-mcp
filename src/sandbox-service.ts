@@ -4,6 +4,8 @@ import {
   bearer,
   pat,
   type Authenticator,
+  type ComputeSize,
+  type Kit,
   type Sandbox,
 } from '@docker/sandboxes';
 
@@ -223,9 +225,23 @@ export function applyTextEdit(
   };
 }
 
+export type SandboxComputeSize = ComputeSize;
+
+export type KitSummary = Kit;
+
+export type PortProtocol = 'tcp';
+
+export interface PortSummary {
+  name?: string;
+  number: number;
+  protocol?: string;
+  url?: string;
+}
+
 export interface CreateSandboxInput {
   kit?: string;
   displayName?: string;
+  resources?: SandboxComputeSize;
   timeoutMs?: number;
 }
 
@@ -276,11 +292,14 @@ export interface ApplyAndRunResult {
 export interface SandboxService {
   readonly workspace?: string;
   createSandbox(input: CreateSandboxInput): Promise<SandboxSummary>;
+  listKits(): Promise<KitSummary[]>;
   listSandboxes(): Promise<SandboxSummary[]>;
   getSandbox(name: string): Promise<SandboxSummary>;
   stopSandbox(name: string): Promise<SandboxSummary>;
   startSandbox(name: string): Promise<SandboxSummary>;
   deleteSandbox(name: string, force?: boolean): Promise<{ deleted: string }>;
+  exposePort(name: string, port: number, protocol?: PortProtocol): Promise<PortSummary>;
+  listPorts(name: string): Promise<PortSummary[]>;
   runCommand(name: string, input: RunCommandInput): Promise<CommandResult>;
   startProcess(name: string, input: RunCommandInput): Promise<ProcessSummary>;
   getProcessOutput(
@@ -400,9 +419,13 @@ export class DockerSandboxService implements SandboxService {
 
   async createSandbox(input: CreateSandboxInput): Promise<SandboxSummary> {
     const kit = input.kit ?? 'shell';
+    const launchOptions = {
+      ...(input.displayName ? { displayName: input.displayName } : {}),
+      ...(input.resources ? { resources: input.resources } : {}),
+    };
     const sandbox = await this.client.kits.launchAndWait(
       kit,
-      input.displayName ? { displayName: input.displayName } : undefined,
+      Object.keys(launchOptions).length > 0 ? launchOptions : undefined,
       input.timeoutMs ? { timeoutMs: input.timeoutMs } : undefined,
     );
     await sandbox.files.mkdir(this.workspace, { parents: true }).catch(() => {});
@@ -410,9 +433,16 @@ export class DockerSandboxService implements SandboxService {
     return toSandboxSummary(sandbox, this.workspace, environment);
   }
 
+  async listKits(): Promise<KitSummary[]> {
+    return this.client.kits.list();
+  }
+
   async listSandboxes(): Promise<SandboxSummary[]> {
-    const page = await this.client.list();
-    return page.items.map((s) => toSandboxSummary(s, this.workspace));
+    const sandboxes: SandboxSummary[] = [];
+    for await (const sandbox of this.client.all()) {
+      sandboxes.push(toSandboxSummary(sandbox, this.workspace));
+    }
+    return sandboxes;
   }
 
   async getSandbox(name: string): Promise<SandboxSummary> {
@@ -440,6 +470,32 @@ export class DockerSandboxService implements SandboxService {
     const deleting = await latest.delete({ force });
     await deleting?.waitUntilDeleted();
     return { deleted: name };
+  }
+
+  async exposePort(
+    name: string,
+    portNumber: number,
+    protocol: PortProtocol = 'tcp',
+  ): Promise<PortSummary> {
+    const sandbox = await this.client.get(name);
+    const port = await sandbox.ports.create({ number: portNumber, protocol });
+    return {
+      ...(port.name ? { name: port.name } : {}),
+      number: port.number,
+      ...(port.protocol ? { protocol: port.protocol } : {}),
+      ...(port.url ? { url: port.url } : {}),
+    };
+  }
+
+  async listPorts(name: string): Promise<PortSummary[]> {
+    const sandbox = await this.client.get(name);
+    const res = await sandbox.ports.list();
+    return (res.published ?? []).map((port) => ({
+      ...(port.name ? { name: port.name } : {}),
+      number: port.number,
+      ...(port.protocol ? { protocol: port.protocol } : {}),
+      ...(port.url ? { url: port.url } : {}),
+    }));
   }
 
   async runCommand(name: string, input: RunCommandInput): Promise<CommandResult> {
@@ -549,12 +605,13 @@ export class DockerSandboxService implements SandboxService {
 
   async writeFiles(name: string, files: FileWriteInput[]): Promise<{ writtenFiles: string[] }> {
     const sandbox = await this.client.get(name);
-    const writtenFiles: string[] = [];
-    for (const file of files) {
-      const targetPath = resolveSandboxPath(file.path, this.workspace);
-      await sandbox.files.write(targetPath, file.content);
-      writtenFiles.push(targetPath);
-    }
+    const writtenFiles = await Promise.all(
+      files.map(async (file) => {
+        const targetPath = resolveSandboxPath(file.path, this.workspace);
+        await sandbox.files.write(targetPath, file.content);
+        return targetPath;
+      }),
+    );
     return { writtenFiles };
   }
 
@@ -773,7 +830,8 @@ export class DockerSandboxService implements SandboxService {
     const files = input.files ?? [];
     const edits = input.edits ?? [];
     const deletes = input.deletes ?? [];
-    const hasCommand = input.command !== undefined || (input.args !== undefined && input.args.length > 0);
+    const hasCommand =
+      input.command !== undefined || (input.args !== undefined && input.args.length > 0);
     const args = hasCommand ? resolveCommandArgs(input) : undefined;
 
     if (!args && files.length === 0 && edits.length === 0 && deletes.length === 0) {
@@ -782,41 +840,52 @@ export class DockerSandboxService implements SandboxService {
       );
     }
 
+    const sandbox = await this.client.get(name);
     const resolvedCwd = resolveSandboxPath(input.cwd, this.workspace);
-    const resolvedFiles = files.map((file) => ({
-      path: resolveSandboxPath(file.path, resolvedCwd),
-      content: file.content,
-    }));
-    const { writtenFiles } =
-      resolvedFiles.length > 0 ? await this.writeFiles(name, resolvedFiles) : { writtenFiles: [] };
+
+    const writtenFiles = await Promise.all(
+      files.map(async (file) => {
+        const targetPath = resolveSandboxPath(file.path, resolvedCwd);
+        await sandbox.files.write(targetPath, file.content);
+        return targetPath;
+      }),
+    );
 
     const editedFiles: FileEditResult[] = [];
     for (const edit of edits) {
-      const editRes = await this.editFile(name, {
-        ...edit,
-        path: resolveSandboxPath(edit.path, resolvedCwd),
-      });
-      editedFiles.push(editRes);
+      const targetPath = resolveSandboxPath(edit.path, resolvedCwd);
+      const current = await sandbox.files.read(targetPath, { encoding: 'utf8' });
+      const { content, replacements } = applyTextEdit(current, edit);
+      await sandbox.files.write(targetPath, content);
+      editedFiles.push({ path: targetPath, replacements });
     }
 
-    const deletedFiles: string[] = [];
-    for (const delPath of deletes) {
-      const { removed } = await this.removeFile(
-        name,
-        resolveSandboxPath(delPath, resolvedCwd),
-        false,
-      );
-      deletedFiles.push(removed);
-    }
+    const deletedFiles = await Promise.all(
+      deletes.map(async (delPath) => {
+        const targetPath = resolveSandboxPath(delPath, resolvedCwd);
+        await sandbox.files.remove(targetPath, { recursive: false });
+        return targetPath;
+      }),
+    );
 
-    const commandResult = args
-      ? await this.runCommand(name, {
+    let commandResult: CommandResult | undefined;
+    if (args) {
+      const result = await sandbox.processes.run(
+        {
           args,
-          cwd: resolvedCwd,
-          env: input.env,
-          timeoutMs: input.timeoutMs,
-        })
-      : undefined;
+          workingDir: resolvedCwd,
+          ...(input.env ? { env: input.env } : {}),
+        },
+        { timeoutMs: input.timeoutMs ?? 120_000 },
+      );
+      commandResult = {
+        exitCode: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        incomplete: result.incomplete,
+        processName: result.process?.name,
+      };
+    }
 
     return { writtenFiles, editedFiles, deletedFiles, ...(commandResult ? { commandResult } : {}) };
   }

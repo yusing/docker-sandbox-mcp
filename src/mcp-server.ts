@@ -16,10 +16,16 @@ import {
 
 const MAX_OUTPUT_CHARS = 32_000;
 
-const SERVER_INSTRUCTIONS =
-  'Manage isolated Docker Cloud Sandboxes for writing files, running commands, builds, tests, ' +
-  'and background processes. Prefer apply_and_run to write files and execute a command in a ' +
-  'single step, and clean up or stop sandboxes when finished.';
+function buildServerInstructions(workspace: string): string {
+  return [
+    `Manage isolated Docker Cloud Sandboxes with default workspace ${workspace}.`,
+    `Relative paths and default cwd resolve against ${workspace}.`,
+    'Use read-only tools (list_files, glob_files, search_files, read_file with startLine/endLine, stat_file) to inspect code without triggering write confirmations.',
+    'Prefer apply_and_run (supporting files, targeted edits, deletes, and an optional shell command string) to batch writes and build/test runs into a single step.',
+    'For long-running builds or servers, use start_background_process, poll incrementally with get_process_output (passing nextResumeFrom), expose preview URLs with expose_port, and stop leaked processes with stop_process.',
+    'Use list_kits to discover available sandbox kits and resources ("micro".."xl") on create_sandbox when sizing matters. Stop or delete sandboxes when finished.',
+  ].join(' ');
+}
 
 export interface FormatFileLinesOptions {
   startLine?: number;
@@ -128,7 +134,7 @@ export function createSandboxMcpServer({
   const server = new FastMCP<SandboxSession>({
     name: 'docker-sandbox-mcp',
     version: '0.1.0',
-    instructions: SERVER_INSTRUCTIONS,
+    instructions: buildServerInstructions(workspace),
     ...(authProvider ? { auth: authProvider } : {}),
     ...(authenticate ? { authenticate } : {}),
     health: {
@@ -186,20 +192,44 @@ export function createSandboxMcpServer({
   });
 
   server.addTool({
+    name: 'list_kits',
+    description: 'List available Docker Cloud Sandbox kits that can be passed to create_sandbox.',
+    parameters: z.object({}),
+    annotations: {
+      title: 'List Sandbox Kits',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async () => {
+      try {
+        const kits = await service.listKits();
+        return jsonText({ kits });
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
     name: 'create_sandbox',
     description:
-      'Create a new isolated Docker Cloud Sandbox from a kit (defaults to "shell") and wait until it is running.',
+      `Create a new isolated Docker Cloud Sandbox from a kit (defaults to "shell"), ensure ${workspace} exists, and wait until it is running.`,
     parameters: z.object({
       kit: z
         .string()
         .min(1)
         .default('shell')
-        .describe('Sandbox kit name or OCI reference (default: "shell").'),
+        .describe('Sandbox kit name or OCI reference (default: "shell"). Use list_kits to see options.'),
       displayName: z
         .string()
         .min(1)
         .optional()
         .describe('Optional human-readable label for the sandbox.'),
+      resources: z
+        .enum(['micro', 'small', 'medium', 'large', 'xl'])
+        .optional()
+        .describe('Optional compute size preset ("micro", "small", "medium", "large", or "xl").'),
       timeoutMs: z
         .number()
         .int()
@@ -215,9 +245,9 @@ export function createSandboxMcpServer({
       idempotentHint: false,
       openWorldHint: false,
     },
-    execute: async ({ kit, displayName, timeoutMs }) => {
+    execute: async ({ kit, displayName, resources, timeoutMs }) => {
       try {
-        const sandbox = await service.createSandbox({ kit, displayName, timeoutMs });
+        const sandbox = await service.createSandbox({ kit, displayName, resources, timeoutMs });
         return jsonText(sandbox);
       } catch (err) {
         return errorText(err);
@@ -927,6 +957,62 @@ export function createSandboxMcpServer({
         const resolvedPath = resolveSandboxPath(targetPath, workspace);
         const res = await service.removeFile(sandboxName, resolvedPath, recursive);
         return jsonText(res);
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'expose_port',
+    description:
+      'Expose a port inside a running Docker Cloud Sandbox and return its public preview URL.',
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+      port: z
+        .number()
+        .int()
+        .min(1)
+        .max(65535)
+        .describe('Port number inside the sandbox to expose (e.g. 3000, 8080).'),
+      protocol: z
+        .enum(['tcp'])
+        .default('tcp')
+        .describe('Transport protocol for the exposed port (default: "tcp").'),
+    }),
+    annotations: {
+      title: 'Expose Port',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName, port, protocol }) => {
+      try {
+        const exposed = await service.exposePort(sandboxName, port, protocol);
+        return jsonText(exposed);
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  });
+
+  server.addTool({
+    name: 'list_ports',
+    description: 'List exposed ports and their public URLs for a Docker Cloud Sandbox.',
+    parameters: z.object({
+      sandboxName: z.string().min(1).describe('Resource name of the sandbox.'),
+    }),
+    annotations: {
+      title: 'List Ports',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    execute: async ({ sandboxName }) => {
+      try {
+        const ports = await service.listPorts(sandboxName);
+        return jsonText({ ports });
       } catch (err) {
         return errorText(err);
       }

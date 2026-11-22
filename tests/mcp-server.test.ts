@@ -28,7 +28,10 @@ import {
   type GetProcessOutputOptions,
   type GlobFilesInput,
   type GlobFilesResult,
+  type KitSummary,
   type ListFilesOptions,
+  type PortProtocol,
+  type PortSummary,
   type ProcessOutputResult,
   type ProcessSignal,
   type ProcessSummary,
@@ -55,11 +58,14 @@ class MockSandboxService implements SandboxService {
   private sandboxes = new Map<string, SandboxSummary>();
   private files = new Map<string, Map<string, string>>();
   private processes = new Map<string, Map<string, ProcessOutputResult>>();
+  private ports = new Map<string, PortSummary[]>();
   lastRunCwd?: string;
   lastStartProcessCwd?: string;
+  lastCreateResources?: string;
 
   async createSandbox(input: CreateSandboxInput): Promise<SandboxSummary> {
     this.counter += 1;
+    this.lastCreateResources = input.resources;
     const uid = `sbx-${this.counter}`;
     const name = `sandboxes/${uid}`;
     const summary: SandboxSummary = {
@@ -78,7 +84,21 @@ class MockSandboxService implements SandboxService {
     this.sandboxes.set(name, summary);
     this.files.set(name, new Map());
     this.processes.set(name, new Map());
+    this.ports.set(name, []);
     return summary;
+  }
+
+  async listKits(): Promise<KitSummary[]> {
+    return [
+      {
+        name: 'shell',
+        displayName: 'Shell',
+        vendor: 'Docker',
+        imageRef: 'docker/sandbox-shell:latest',
+        source: 'builtin',
+        digest: 'sha256:deadbeef',
+      },
+    ];
   }
 
   async listSandboxes(): Promise<SandboxSummary[]> {
@@ -108,7 +128,29 @@ class MockSandboxService implements SandboxService {
     this.sandboxes.delete(name);
     this.files.delete(name);
     this.processes.delete(name);
+    this.ports.delete(name);
     return { deleted: name };
+  }
+
+  async exposePort(
+    name: string,
+    port: number,
+    protocol: PortProtocol = 'tcp',
+  ): Promise<PortSummary> {
+    await this.getSandbox(name);
+    const entry: PortSummary = {
+      name: `${name}/ports/${port}`,
+      number: port,
+      protocol,
+      url: `https://${port}-sbx.preview.example.com`,
+    };
+    this.ports.get(name)!.push(entry);
+    return entry;
+  }
+
+  async listPorts(name: string): Promise<PortSummary[]> {
+    await this.getSandbox(name);
+    return this.ports.get(name) ?? [];
   }
 
   async runCommand(name: string, input: RunCommandInput): Promise<CommandResult> {
@@ -402,8 +444,11 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
 
       const listed = await client.listTools();
       const toolMap = new Map(listed.tools.map((t) => [t.name, t]));
+      assert.equal(toolMap.get('list_kits')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('list_sandboxes')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('get_sandbox')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('list_ports')?.annotations?.readOnlyHint, true);
+      assert.equal(toolMap.get('expose_port')?.annotations?.readOnlyHint, false);
       assert.equal(toolMap.get('read_file')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('list_files')?.annotations?.readOnlyHint, true);
       assert.equal(toolMap.get('glob_files')?.annotations?.readOnlyHint, true);
@@ -417,15 +462,20 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       assert.equal(toolMap.get('remove_file')?.annotations?.destructiveHint, true);
       assert.equal(toolMap.get('delete_sandbox')?.annotations?.destructiveHint, true);
 
+      const kitsRes = await client.callTool({ name: 'list_kits', arguments: {} });
+      const kits = JSON.parse((kitsRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(kits.kits[0].name, 'shell');
+
       const createdRes = await client.callTool({
         name: 'create_sandbox',
-        arguments: { kit: 'shell', displayName: 'ci-test' },
+        arguments: { kit: 'shell', displayName: 'ci-test', resources: 'medium' },
       });
       const created = JSON.parse((createdRes.content as Array<{ text: string }>)[0].text);
       assert.equal(created.name, 'sandboxes/sbx-1');
       assert.equal(created.status, 'RUNNING');
       assert.equal(created.workspace, '/workspace');
       assert.equal(created.environment.user, 'agent');
+      assert.equal(service.lastCreateResources, 'medium');
 
       const applyRes = await client.callTool({
         name: 'apply_and_run',
@@ -610,6 +660,22 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       const stoppedProc = JSON.parse((stopProcRes.content as Array<{ text: string }>)[0].text);
       assert.equal(stoppedProc.status, 'EXITED');
       assert.equal(stoppedProc.exitCode, 143);
+
+      const exposeRes = await client.callTool({
+        name: 'expose_port',
+        arguments: { sandboxName: created.name, port: 3000 },
+      });
+      const exposed = JSON.parse((exposeRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(exposed.number, 3000);
+      assert.match(exposed.url, /https:\/\/3000-sbx/);
+
+      const portsRes = await client.callTool({
+        name: 'list_ports',
+        arguments: { sandboxName: created.name },
+      });
+      const ports = JSON.parse((portsRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(ports.ports.length, 1);
+      assert.equal(ports.ports[0].number, 3000);
 
       await client.callTool({ name: 'stop_sandbox', arguments: { sandboxName: created.name } });
       const stopped = JSON.parse(
