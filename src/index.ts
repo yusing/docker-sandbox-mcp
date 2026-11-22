@@ -1,7 +1,12 @@
 import express, { type Express, type Request, type Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { buildProtectedResourceMetadata, createAuthMiddleware, type AuthConfig } from './auth.js';
+import {
+  authConfigFromEnv,
+  buildProtectedResourceMetadata,
+  createAuthMiddleware,
+  type AuthConfig,
+} from './auth.js';
 import { createSandboxMcpServer } from './mcp-server.js';
 import { DockerSandboxService, type SandboxService } from './sandbox-service.js';
 
@@ -18,9 +23,12 @@ export function createHttpApp({ service, auth = {} }: HttpAppOptions): Express {
     res.status(200).json({ status: 'ok', service: 'docker-sandbox-mcp' });
   });
 
-  app.get('/.well-known/oauth-protected-resource', (_req: Request, res: Response) => {
+  // RFC 9728 Protected Resource Metadata (root and path-scoped variants)
+  const serveResourceMetadata = (_req: Request, res: Response) => {
     res.status(200).json(buildProtectedResourceMetadata(auth));
-  });
+  };
+  app.get('/.well-known/oauth-protected-resource', serveResourceMetadata);
+  app.get('/.well-known/oauth-protected-resource/mcp', serveResourceMetadata);
 
   const authMiddleware = createAuthMiddleware(auth);
 
@@ -92,11 +100,7 @@ async function main(): Promise<void> {
   const port = Number(process.env.PORT ?? 8080);
   const app = createHttpApp({
     service,
-    auth: {
-      bearerToken: process.env.MCP_BEARER_TOKEN,
-      publicUrl: process.env.PUBLIC_URL,
-      oauthIssuer: process.env.OAUTH_ISSUER,
-    },
+    auth: authConfigFromEnv(process.env),
   });
 
   const httpServer = app.listen(port, () => {
