@@ -62,6 +62,25 @@ export function authConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AuthCon
   };
 }
 
+/**
+ * Resolves the public origin for RFC 9728 metadata and WWW-Authenticate headers.
+ * Prefers PUBLIC_URL, falling back to X-Forwarded-Proto + Host (e.g. behind GoDoxy / Cloud Run).
+ */
+export function resolvePublicOrigin(config: AuthConfig, req?: Request): string {
+  if (config.publicUrl) {
+    return config.publicUrl.replace(/\/$/, '');
+  }
+  if (req) {
+    const forwardedProto = req.header('x-forwarded-proto')?.split(',')[0]?.trim();
+    const proto = forwardedProto || req.protocol || 'https';
+    const host = req.header('x-forwarded-host')?.split(',')[0]?.trim() || req.header('host');
+    if (host) {
+      return `${proto}://${host}`;
+    }
+  }
+  return 'http://localhost:8080';
+}
+
 function constantTimeEquals(a: string, b: string): boolean {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
@@ -94,12 +113,17 @@ function extractScopes(payload: Record<string, unknown>): string[] {
   return Array.from(out);
 }
 
-function buildWwwAuthenticate(config: AuthConfig, error?: string, description?: string): string {
-  const parts = ['Bearer realm="docker-sandbox-mcp"'];
-  if (config.publicUrl) {
-    const base = config.publicUrl.replace(/\/$/, '');
-    parts.push(`resource_metadata="${base}/.well-known/oauth-protected-resource"`);
-  }
+function buildWwwAuthenticate(
+  config: AuthConfig,
+  req: Request,
+  error?: string,
+  description?: string,
+): string {
+  const origin = resolvePublicOrigin(config, req);
+  const parts = [
+    'Bearer realm="docker-sandbox-mcp"',
+    `resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
+  ];
   if (error) parts.push(`error="${error}"`);
   if (description) parts.push(`error_description="${description.replace(/"/g, "'")}"`);
   return parts.join(', ');
@@ -306,10 +330,10 @@ export function createAuthMiddleware(config: AuthConfig) {
     const header = req.header('authorization') ?? '';
     const match = /^Bearer\s+(.+)$/i.exec(header.trim());
     if (!match) {
-      res.setHeader('WWW-Authenticate', buildWwwAuthenticate(config));
+      res.setHeader('WWW-Authenticate', buildWwwAuthenticate(config, req));
       res.status(401).json({
         error: 'unauthorized',
-        message: 'Authorization: Bearer <token> header required.',
+        message: 'OAuth 2.0 Bearer access token required.',
       });
       return;
     }
@@ -331,7 +355,7 @@ export function createAuthMiddleware(config: AuthConfig) {
         if (err instanceof AuthInsufficientScopeError) {
           res.setHeader(
             'WWW-Authenticate',
-            buildWwwAuthenticate(config, 'insufficient_scope', err.message),
+            buildWwwAuthenticate(config, req, 'insufficient_scope', err.message),
           );
           res.status(403).json({
             error: 'insufficient_scope',
@@ -349,7 +373,7 @@ export function createAuthMiddleware(config: AuthConfig) {
         const detail = err instanceof Error ? err.message : 'Invalid token';
         res.setHeader(
           'WWW-Authenticate',
-          buildWwwAuthenticate(config, 'invalid_token', detail),
+          buildWwwAuthenticate(config, req, 'invalid_token', detail),
         );
         res.status(401).json({
           error: 'invalid_token',
@@ -359,7 +383,7 @@ export function createAuthMiddleware(config: AuthConfig) {
       }
     }
 
-    res.setHeader('WWW-Authenticate', buildWwwAuthenticate(config, 'invalid_token'));
+    res.setHeader('WWW-Authenticate', buildWwwAuthenticate(config, req, 'invalid_token'));
     res.status(401).json({
       error: 'unauthorized',
       message: 'Invalid Bearer token.',
@@ -371,10 +395,13 @@ export function createAuthMiddleware(config: AuthConfig) {
  * RFC 9728 OAuth 2.0 Protected Resource Metadata document for MCP clients
  * (including Gemini Web Connected Apps).
  */
-export function buildProtectedResourceMetadata(config: AuthConfig): Record<string, unknown> {
-  const resource = (config.publicUrl ?? 'http://localhost:8080').replace(/\/$/, '');
+export function buildProtectedResourceMetadata(
+  config: AuthConfig,
+  req?: Request,
+): Record<string, unknown> {
+  const origin = resolvePublicOrigin(config, req);
   return {
-    resource: `${resource}/mcp`,
+    resource: `${origin}/mcp`,
     ...(config.oauthIssuer ? { authorization_servers: [config.oauthIssuer] } : {}),
     bearer_methods_supported: ['header'],
     scopes_supported:

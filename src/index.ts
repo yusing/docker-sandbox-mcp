@@ -17,6 +17,7 @@ export interface HttpAppOptions {
 
 export function createHttpApp({ service, auth = {} }: HttpAppOptions): Express {
   const app = express();
+  app.set('trust proxy', true);
   app.use(express.json({ limit: '4mb' }));
 
   app.get('/healthz', (_req: Request, res: Response) => {
@@ -24,11 +25,39 @@ export function createHttpApp({ service, auth = {} }: HttpAppOptions): Express {
   });
 
   // RFC 9728 Protected Resource Metadata (root and path-scoped variants)
-  const serveResourceMetadata = (_req: Request, res: Response) => {
-    res.status(200).json(buildProtectedResourceMetadata(auth));
+  const serveResourceMetadata = (req: Request, res: Response) => {
+    res.status(200).json(buildProtectedResourceMetadata(auth, req));
   };
   app.get('/.well-known/oauth-protected-resource', serveResourceMetadata);
   app.get('/.well-known/oauth-protected-resource/mcp', serveResourceMetadata);
+
+  // Fallback RFC 8414 Authorization Server Metadata proxy for clients that query
+  // /.well-known/oauth-authorization-server directly on the MCP host.
+  if (auth.oauthIssuer) {
+    const issuerBase = auth.oauthIssuer.replace(/\/$/, '');
+    let cachedAsMeta: { data: unknown; expiresAt: number } | undefined;
+    app.get('/.well-known/oauth-authorization-server', async (_req: Request, res: Response) => {
+      try {
+        const now = Date.now();
+        if (!cachedAsMeta || cachedAsMeta.expiresAt <= now) {
+          const upstream = await fetch(`${issuerBase}/.well-known/openid-configuration`, {
+            headers: { accept: 'application/json' },
+          });
+          if (!upstream.ok) {
+            res.status(502).json({ error: 'upstream_oidc_discovery_failed' });
+            return;
+          }
+          cachedAsMeta = {
+            data: await upstream.json(),
+            expiresAt: now + 5 * 60_000,
+          };
+        }
+        res.status(200).json(cachedAsMeta.data);
+      } catch {
+        res.status(502).json({ error: 'upstream_oidc_discovery_failed' });
+      }
+    });
+  }
 
   const authMiddleware = createAuthMiddleware(auth);
 
