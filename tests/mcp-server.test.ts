@@ -7,6 +7,7 @@ import { createSandboxMcpServer } from '../src/mcp-server.js';
 import {
   DEFAULT_WORKSPACE,
   createDockerAuthenticator,
+  resolveCommandArgs,
   resolveSandboxPath,
   type ApplyAndRunInput,
   type ApplyAndRunResult,
@@ -95,10 +96,11 @@ class MockSandboxService implements SandboxService {
 
   async runCommand(name: string, input: RunCommandInput): Promise<CommandResult> {
     await this.getSandbox(name);
+    const args = resolveCommandArgs(input);
     this.lastRunCwd = input.cwd;
     return {
       exitCode: 0,
-      stdout: `ran: ${input.args.join(' ')}`,
+      stdout: `ran: ${args.join(' ')}`,
       stderr: '',
       incomplete: false,
       processName: `${name}/processes/proc-1`,
@@ -107,6 +109,7 @@ class MockSandboxService implements SandboxService {
 
   async startProcess(name: string, input: RunCommandInput): Promise<ProcessSummary> {
     await this.getSandbox(name);
+    const args = resolveCommandArgs(input);
     this.lastStartProcessCwd = input.cwd;
     const procName = `${name}/processes/bg-1`;
     const summary: ProcessSummary = {
@@ -116,7 +119,7 @@ class MockSandboxService implements SandboxService {
     };
     this.processes.get(name)!.set(procName, {
       process: summary,
-      output: 'server listening on :3000\n',
+      output: `server listening on :3000 (${args.join(' ')})\n`,
     });
     return summary;
   }
@@ -271,9 +274,29 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
       assert.equal(listedFiles.entries.length, 1);
       assert.equal(listedFiles.entries[0].path, '/workspace/app/hello.txt');
 
+      const runCmdRes = await client.callTool({
+        name: 'run_command',
+        arguments: {
+          sandboxName: created.name,
+          command: 'ls -la && echo done',
+        },
+      });
+      const runCmd = JSON.parse((runCmdRes.content as Array<{ text: string }>)[0].text);
+      assert.equal(runCmd.stdout, 'ran: bash -lc ls -la && echo done');
+
+      const badCmdRes = await client.callTool({
+        name: 'run_command',
+        arguments: {
+          sandboxName: created.name,
+          command: 'echo hi',
+          args: ['echo', 'hi'],
+        },
+      });
+      assert.equal(badCmdRes.isError, true);
+
       const bgRes = await client.callTool({
         name: 'start_background_process',
-        arguments: { sandboxName: created.name, args: ['node', 'server.js'] },
+        arguments: { sandboxName: created.name, command: 'npm run dev' },
       });
       const bg = JSON.parse((bgRes.content as Array<{ text: string }>)[0].text);
       assert.equal(service.lastStartProcessCwd, '/workspace');
@@ -310,6 +333,21 @@ describe('docker-sandbox-mcp tools & HTTP transport', () => {
     assert.equal(resolveSandboxPath('src/index.ts'), '/workspace/src/index.ts');
     assert.equal(resolveSandboxPath('../other', '/workspace/app'), '/workspace/other');
     assert.equal(resolveSandboxPath('/etc/hosts', '/workspace/app'), '/etc/hosts');
+  });
+
+  it('resolves command strings to bash -lc and rejects ambiguous or empty command inputs', () => {
+    assert.deepEqual(resolveCommandArgs({ command: 'npm test | tail -n 20' }), [
+      'bash',
+      '-lc',
+      'npm test | tail -n 20',
+    ]);
+    assert.deepEqual(resolveCommandArgs({ args: ['pytest', '-q'] }), ['pytest', '-q']);
+    assert.throws(() => resolveCommandArgs({}), /Provide either "command"/);
+    assert.throws(
+      () => resolveCommandArgs({ command: 'ls', args: ['ls'] }),
+      /not both/,
+    );
+    assert.throws(() => resolveCommandArgs({ command: '   ' }), /must not be empty/);
   });
 
   it('throws clear error when Docker credentials are missing', () => {

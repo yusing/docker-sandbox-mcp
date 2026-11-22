@@ -75,8 +75,27 @@ export interface CreateSandboxInput {
   timeoutMs?: number;
 }
 
+export function resolveCommandArgs(input: { command?: string; args?: string[] }): string[] {
+  const hasCommand = input.command !== undefined;
+  const hasArgs = input.args !== undefined && input.args.length > 0;
+  if (hasCommand && hasArgs) {
+    throw new Error('Provide either "command" or "args", not both.');
+  }
+  if (hasCommand) {
+    if (!input.command!.trim()) {
+      throw new Error('"command" must not be empty.');
+    }
+    return ['bash', '-lc', input.command!];
+  }
+  if (hasArgs) {
+    return input.args!;
+  }
+  throw new Error('Provide either "command" (shell string) or "args" (argv array).');
+}
+
 export interface RunCommandInput {
-  args: string[];
+  command?: string;
+  args?: string[];
   cwd?: string;
   env?: Record<string, string>;
   timeoutMs?: number;
@@ -84,7 +103,8 @@ export interface RunCommandInput {
 
 export interface ApplyAndRunInput {
   files: FileWriteInput[];
-  args: string[];
+  command?: string;
+  args?: string[];
   cwd?: string;
   env?: Record<string, string>;
   timeoutMs?: number;
@@ -248,11 +268,12 @@ export class DockerSandboxService implements SandboxService {
   }
 
   async runCommand(name: string, input: RunCommandInput): Promise<CommandResult> {
+    const args = resolveCommandArgs(input);
     const sandbox = await this.client.get(name);
     const workingDir = resolveSandboxPath(input.cwd, this.workspace);
     const result = await sandbox.processes.run(
       {
-        args: input.args,
+        args,
         workingDir,
         ...(input.env ? { env: input.env } : {}),
       },
@@ -268,10 +289,11 @@ export class DockerSandboxService implements SandboxService {
   }
 
   async startProcess(name: string, input: RunCommandInput): Promise<ProcessSummary> {
+    const args = resolveCommandArgs(input);
     const sandbox = await this.client.get(name);
     const workingDir = resolveSandboxPath(input.cwd, this.workspace);
     const proc = await sandbox.processes.start({
-      args: input.args,
+      args,
       workingDir,
       ...(input.env ? { env: input.env } : {}),
     });
@@ -336,6 +358,7 @@ export class DockerSandboxService implements SandboxService {
   }
 
   async applyAndRun(name: string, input: ApplyAndRunInput): Promise<ApplyAndRunResult> {
+    const args = resolveCommandArgs(input);
     const resolvedCwd = resolveSandboxPath(input.cwd, this.workspace);
     const resolvedFiles = input.files.map((file) => ({
       path: resolveSandboxPath(file.path, resolvedCwd),
@@ -343,7 +366,7 @@ export class DockerSandboxService implements SandboxService {
     }));
     const { writtenFiles } = await this.writeFiles(name, resolvedFiles);
     const commandResult = await this.runCommand(name, {
-      args: input.args,
+      args,
       cwd: resolvedCwd,
       env: input.env,
       timeoutMs: input.timeoutMs,

@@ -9,6 +9,7 @@ import {
 } from './auth.js';
 import {
   DEFAULT_WORKSPACE,
+  resolveCommandArgs,
   resolveSandboxPath,
   type SandboxService,
 } from './sandbox-service.js';
@@ -170,7 +171,7 @@ export function createSandboxMcpServer({
   server.addTool({
     name: 'apply_and_run',
     description:
-      `Write one or more files into a sandbox and execute a command (such as build or test) in a single step. Relative paths resolve against cwd (default: ${workspace}). Ideal for Gemini Web to minimize write confirmations.`,
+      `Write one or more files into a sandbox and execute a command (such as build or test) in a single step. Relative paths resolve against cwd (default: ${workspace}). Provide either command (shell string) or args (argv array). Ideal for Gemini Web to minimize write confirmations.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the target sandbox.'),
       files: z
@@ -185,10 +186,16 @@ export function createSandboxMcpServer({
         )
         .default([])
         .describe('Files to write before running the command.'),
+      command: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Shell command string executed via `bash -lc` (supports pipes, &&, redirects, globs). Mutually exclusive with args.'),
       args: z
         .array(z.string().min(1))
         .min(1)
-        .describe('Command and arguments to execute (e.g. ["sh", "-c", "npm test"]).'),
+        .optional()
+        .describe('Direct argv array to execute without a shell (e.g. ["npm", "test"]). Mutually exclusive with command.'),
       cwd: z
         .string()
         .min(1)
@@ -213,8 +220,9 @@ export function createSandboxMcpServer({
       idempotentHint: false,
       openWorldHint: false,
     },
-    execute: async ({ sandboxName, files, args, cwd, env, timeoutMs }) => {
+    execute: async ({ sandboxName, files, command, args, cwd, env, timeoutMs }) => {
       try {
+        const resolvedArgs = resolveCommandArgs({ command, args });
         const resolvedCwd = resolveSandboxPath(cwd, workspace);
         const resolvedFiles = files.map((f) => ({
           path: resolveSandboxPath(f.path, resolvedCwd),
@@ -222,7 +230,7 @@ export function createSandboxMcpServer({
         }));
         const res = await service.applyAndRun(sandboxName, {
           files: resolvedFiles,
-          args,
+          args: resolvedArgs,
           cwd: resolvedCwd,
           env,
           timeoutMs,
@@ -244,13 +252,19 @@ export function createSandboxMcpServer({
   server.addTool({
     name: 'run_command',
     description:
-      `Execute a command inside a running Docker Cloud Sandbox and return exit code, stdout, and stderr. Defaults to ${workspace}.`,
+      `Execute a command inside a running Docker Cloud Sandbox and return exit code, stdout, and stderr. Provide either command (shell string) or args (argv array). Defaults to ${workspace}.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the target sandbox.'),
+      command: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Shell command string executed via `bash -lc` (supports pipes, &&, redirects, globs). Mutually exclusive with args.'),
       args: z
         .array(z.string().min(1))
         .min(1)
-        .describe('Command and arguments to execute (e.g. ["bash", "-lc", "pytest"]).'),
+        .optional()
+        .describe('Direct argv array to execute without a shell (e.g. ["pytest", "-q"]). Mutually exclusive with command.'),
       cwd: z
         .string()
         .min(1)
@@ -272,11 +286,12 @@ export function createSandboxMcpServer({
       idempotentHint: false,
       openWorldHint: false,
     },
-    execute: async ({ sandboxName, args, cwd, env, timeoutMs }) => {
+    execute: async ({ sandboxName, command, args, cwd, env, timeoutMs }) => {
       try {
+        const resolvedArgs = resolveCommandArgs({ command, args });
         const resolvedCwd = resolveSandboxPath(cwd, workspace);
         const res = await service.runCommand(sandboxName, {
-          args,
+          args: resolvedArgs,
           cwd: resolvedCwd,
           env,
           timeoutMs,
@@ -298,10 +313,19 @@ export function createSandboxMcpServer({
   server.addTool({
     name: 'start_background_process',
     description:
-      `Start a long-running command asynchronously inside a sandbox (such as a dev server or large build) and return its process handle for polling with get_process_output. Defaults to ${workspace}.`,
+      `Start a long-running command asynchronously inside a sandbox (such as a dev server or large build) and return its process handle for polling with get_process_output. Provide either command (shell string) or args (argv array). Defaults to ${workspace}.`,
     parameters: z.object({
       sandboxName: z.string().min(1).describe('Resource name of the target sandbox.'),
-      args: z.array(z.string().min(1)).min(1).describe('Command and arguments to execute.'),
+      command: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Shell command string executed via `bash -lc`. Mutually exclusive with args.'),
+      args: z
+        .array(z.string().min(1))
+        .min(1)
+        .optional()
+        .describe('Direct argv array to execute without a shell. Mutually exclusive with command.'),
       cwd: z
         .string()
         .min(1)
@@ -316,11 +340,12 @@ export function createSandboxMcpServer({
       idempotentHint: false,
       openWorldHint: false,
     },
-    execute: async ({ sandboxName, args, cwd, env }) => {
+    execute: async ({ sandboxName, command, args, cwd, env }) => {
       try {
+        const resolvedArgs = resolveCommandArgs({ command, args });
         const resolvedCwd = resolveSandboxPath(cwd, workspace);
         const proc = await service.startProcess(sandboxName, {
-          args,
+          args: resolvedArgs,
           cwd: resolvedCwd,
           env,
         });
