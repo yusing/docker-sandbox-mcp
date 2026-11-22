@@ -17,7 +17,6 @@ describe('OAuth 2.0 / OIDC JWKS JWT verification', () => {
     publicJwk.alg = 'RS256';
     publicJwk.use = 'sig';
 
-    // Spin up a mock OIDC issuer exposing /.well-known/openid-configuration and /jwks.json
     let issuerBaseUrl = '';
     const oidcServer = http.createServer((req, res) => {
       if (req.url === '/.well-known/openid-configuration') {
@@ -91,14 +90,12 @@ describe('OAuth 2.0 / OIDC JWKS JWT verification', () => {
       });
 
     try {
-      // 1. RFC 9728 metadata (both root and /mcp suffix)
       const meta = await fetch(`${mcpBaseUrl}/.well-known/oauth-protected-resource/mcp`);
       assert.equal(meta.status, 200);
       const metaJson = (await meta.json()) as Record<string, unknown>;
       assert.deepEqual(metaJson.authorization_servers, [issuerBaseUrl]);
       assert.equal(metaJson.resource, 'https://mcp.example.com/mcp');
 
-      // 2. Valid JWT passes
       const validToken = await sign({
         sub: 'user-123',
         email: 'OWNER@example.com',
@@ -108,7 +105,6 @@ describe('OAuth 2.0 / OIDC JWKS JWT verification', () => {
       const okBody = await okRes.text();
       assert.equal(okRes.status, 200, okBody);
 
-      // 3. Disallowed email -> 403 Forbidden
       const wrongUserToken = await sign({
         sub: 'user-999',
         email: 'intruder@example.com',
@@ -117,7 +113,6 @@ describe('OAuth 2.0 / OIDC JWKS JWT verification', () => {
       const forbiddenRes = await postMcp(wrongUserToken);
       assert.equal(forbiddenRes.status, 403);
 
-      // 4. Missing required scope -> 403 insufficient_scope
       const lowScopeToken = await sign({
         sub: 'user-123',
         email: 'owner@example.com',
@@ -127,7 +122,6 @@ describe('OAuth 2.0 / OIDC JWKS JWT verification', () => {
       assert.equal(scopeRes.status, 403);
       assert.match(scopeRes.headers.get('www-authenticate') ?? '', /insufficient_scope/);
 
-      // 5. Expired token -> 401 invalid_token
       const expiredToken = await sign(
         { sub: 'user-123', email: 'owner@example.com', scope: 'sandboxes:write' },
         '-10s',
@@ -138,6 +132,116 @@ describe('OAuth 2.0 / OIDC JWKS JWT verification', () => {
     } finally {
       await new Promise<void>((resolve) => mcpServer.close(() => resolve()));
       await new Promise<void>((resolve) => oidcServer.close(() => resolve()));
+    }
+  });
+
+  it('verifies opaque Google OAuth 2.0 access tokens via tokeninfo with aud and email checks', async () => {
+    let tokenInfoCalls = 0;
+    const futureExp = String(Math.floor(Date.now() / 1000) + 3600);
+
+    const tokenInfoServer = http.createServer((req, res) => {
+      if (req.url !== '/tokeninfo' || req.method !== 'POST') {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.on('data', (chunk) => {
+        raw += chunk;
+      });
+      req.on('end', () => {
+        tokenInfoCalls += 1;
+        const params = new URLSearchParams(raw);
+        const token = params.get('access_token');
+        if (token === 'ya29.valid-owner-token') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              aud: '123456.apps.googleusercontent.com',
+              sub: 'google-sub-1',
+              email: 'owner@gmail.com',
+              email_verified: 'true',
+              scope: 'openid email profile',
+              exp: futureExp,
+            }),
+          );
+          return;
+        }
+        if (token === 'ya29.wrong-aud-token') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              aud: '999999.apps.googleusercontent.com',
+              sub: 'google-sub-1',
+              email: 'owner@gmail.com',
+              email_verified: 'true',
+              exp: futureExp,
+            }),
+          );
+          return;
+        }
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error_description: 'Invalid Value' }));
+      });
+    });
+
+    await new Promise<void>((resolve) => tokenInfoServer.listen(0, '127.0.0.1', resolve));
+    const tiAddr = tokenInfoServer.address();
+    assert(tiAddr && typeof tiAddr !== 'string');
+    const tokenInfoUri = `http://127.0.0.1:${tiAddr.port}/tokeninfo`;
+
+    const app = createHttpApp({
+      service: noopService,
+      auth: {
+        publicUrl: 'https://sbx-mcp.example.com',
+        oauthIssuer: 'https://accounts.google.com',
+        oauthAudience: '123456.apps.googleusercontent.com',
+        oauthTokenInfoUri: tokenInfoUri,
+        allowedEmails: ['owner@gmail.com'],
+      },
+    });
+
+    const mcpServer = http.createServer(app);
+    await new Promise<void>((resolve) => mcpServer.listen(0, '127.0.0.1', resolve));
+    const mcpAddr = mcpServer.address();
+    assert(mcpAddr && typeof mcpAddr !== 'string');
+    const mcpBaseUrl = `http://127.0.0.1:${mcpAddr.port}`;
+
+    const postMcp = (token: string) =>
+      fetch(`${mcpBaseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: 'gemini-web', version: '1.0.0' },
+          },
+        }),
+      });
+
+    try {
+      const res1 = await postMcp('ya29.valid-owner-token');
+      assert.equal(res1.status, 200, await res1.text());
+      const res2 = await postMcp('ya29.valid-owner-token');
+      assert.equal(res2.status, 200, await res2.text());
+      assert.equal(tokenInfoCalls, 1);
+
+      const wrongAud = await postMcp('ya29.wrong-aud-token');
+      assert.equal(wrongAud.status, 401);
+
+      const invalid = await postMcp('ya29.bogus');
+      assert.equal(invalid.status, 401);
+    } finally {
+      await new Promise<void>((resolve) => mcpServer.close(() => resolve()));
+      await new Promise<void>((resolve) => tokenInfoServer.close(() => resolve()));
     }
   });
 });

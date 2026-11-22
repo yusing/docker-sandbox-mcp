@@ -5,33 +5,39 @@ import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
 export interface AuthConfig {
   /** Optional static Bearer token for local/dev or simple proxy auth. */
   bearerToken?: string;
-  /** Public base URL of this MCP server (e.g. https://mcp.example.com). */
+  /** Public base URL of this MCP server (e.g. https://sbx-mcp.example.com). */
   publicUrl?: string;
-  /** OIDC / OAuth 2.0 issuer URL (e.g. https://accounts.google.com or https://tenant.auth0.com/). */
+  /** OIDC / OAuth 2.0 issuer URL (e.g. https://accounts.google.com). */
   oauthIssuer?: string;
-  /** Expected JWT audience (`aud` claim). Defaults to `${publicUrl}/mcp` if omitted when oauthAudience is set. */
+  /** Expected JWT `aud` claim or Google OAuth Client ID (`*.apps.googleusercontent.com`). */
   oauthAudience?: string;
   /** Explicit JWKS URI override. If omitted, discovered via `${oauthIssuer}/.well-known/openid-configuration`. */
   oauthJwksUri?: string;
+  /** Tokeninfo endpoint for opaque OAuth access tokens (auto-defaults to Google's tokeninfo when oauthIssuer is https://accounts.google.com). */
+  oauthTokenInfoUri?: string;
   /** Optional allowlist of authorized `sub` claims. */
   allowedSubjects?: string[];
   /** Optional allowlist of authorized `email` claims (case-insensitive). */
   allowedEmails?: string[];
-  /** Optional list of scopes that must all be present in the JWT `scope` or `scp` claim. */
+  /** Optional list of scopes that must all be present in the token's `scope` or `scp` claim. */
   requiredScopes?: string[];
 }
 
 export interface VerifiedAuth {
-  mode: 'oauth-jwt' | 'static-bearer';
+  mode: 'oauth-jwt' | 'oauth-opaque' | 'static-bearer';
   subject?: string;
   email?: string;
   scopes: string[];
-  claims?: JWTPayload;
+  claims?: JWTPayload | Record<string, unknown>;
 }
 
 export interface AuthenticatedRequest extends Request {
   auth?: VerifiedAuth;
 }
+
+const GOOGLE_ISSUER = 'https://accounts.google.com';
+const GOOGLE_TOKENINFO_URI = 'https://oauth2.googleapis.com/tokeninfo';
+const OPAQUE_CACHE_MAX_TTL_MS = 60_000;
 
 export function parseCsvEnv(value?: string): string[] | undefined {
   if (!value) return undefined;
@@ -49,6 +55,7 @@ export function authConfigFromEnv(env: NodeJS.ProcessEnv = process.env): AuthCon
     oauthIssuer: env.OAUTH_ISSUER,
     oauthAudience: env.OAUTH_AUDIENCE,
     oauthJwksUri: env.OAUTH_JWKS_URI,
+    oauthTokenInfoUri: env.OAUTH_TOKENINFO_URI,
     allowedSubjects: parseCsvEnv(env.OAUTH_ALLOWED_SUBS),
     allowedEmails: parseCsvEnv(env.OAUTH_ALLOWED_EMAILS),
     requiredScopes: parseCsvEnv(env.OAUTH_REQUIRED_SCOPES),
@@ -62,14 +69,19 @@ function constantTimeEquals(a: string, b: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
-function extractScopes(payload: JWTPayload): string[] {
+function isJwtFormat(token: string): boolean {
+  const parts = token.split('.');
+  return parts.length === 3 && parts.every((p) => p.length > 0);
+}
+
+function extractScopes(payload: Record<string, unknown>): string[] {
   const out = new Set<string>();
   if (typeof payload.scope === 'string') {
     for (const s of payload.scope.split(/\s+/)) {
       if (s) out.add(s);
     }
   }
-  const scp = (payload as Record<string, unknown>).scp;
+  const scp = payload.scp;
   if (Array.isArray(scp)) {
     for (const s of scp) {
       if (typeof s === 'string' && s) out.add(s);
@@ -93,18 +105,21 @@ function buildWwwAuthenticate(config: AuthConfig, error?: string, description?: 
   return parts.join(', ');
 }
 
-export interface JwtVerifier {
+export interface TokenVerifier {
   verify(token: string): Promise<VerifiedAuth>;
 }
 
 /**
- * Creates a JWKS-backed OAuth 2.0 / OIDC JWT verifier.
- * Automatically discovers `jwks_uri` from `.well-known/openid-configuration` when
- * `oauthJwksUri` is not explicitly provided, and caches the remote JWKS resolver.
+ * Creates a verifier that handles both:
+ * - Signed JWTs via OIDC JWKS discovery (`jose.jwtVerify`)
+ * - Opaque OAuth 2.0 access tokens (such as Google Cloud OAuth `ya29.*` tokens) via
+ *   the tokeninfo endpoint with short-lived in-memory caching.
  */
-export function createJwtVerifier(config: AuthConfig): JwtVerifier {
-  if (!config.oauthIssuer && !config.oauthJwksUri) {
-    throw new Error('Either oauthIssuer or oauthJwksUri is required for OAuth JWT verification.');
+export function createJwtVerifier(config: AuthConfig): TokenVerifier {
+  if (!config.oauthIssuer && !config.oauthJwksUri && !config.oauthTokenInfoUri) {
+    throw new Error(
+      'One of oauthIssuer, oauthJwksUri, or oauthTokenInfoUri is required for OAuth verification.',
+    );
   }
 
   let jwksPromise: Promise<ReturnType<typeof createRemoteJWKSet>> | undefined;
@@ -136,13 +151,111 @@ export function createJwtVerifier(config: AuthConfig): JwtVerifier {
     return jwksPromise;
   }
 
+  const normalizedIssuer = config.oauthIssuer?.replace(/\/$/, '');
+  const tokenInfoUri =
+    config.oauthTokenInfoUri ??
+    (normalizedIssuer === GOOGLE_ISSUER ? GOOGLE_TOKENINFO_URI : undefined);
+
+  const opaqueCache = new Map<string, { auth: VerifiedAuth; expiresAt: number }>();
+
   const allowedSubs = config.allowedSubjects ? new Set(config.allowedSubjects) : undefined;
   const allowedEmails = config.allowedEmails
     ? new Set(config.allowedEmails.map((e) => e.toLowerCase()))
     : undefined;
 
+  function enforcePolicy(
+    mode: 'oauth-jwt' | 'oauth-opaque',
+    subject: string | undefined,
+    email: string | undefined,
+    scopes: string[],
+    claims: Record<string, unknown>,
+  ): VerifiedAuth {
+    if (allowedSubs && (!subject || !allowedSubs.has(subject))) {
+      throw new AuthForbiddenError('Token subject is not authorized to access this MCP server.');
+    }
+
+    if (allowedEmails && (!email || !allowedEmails.has(email.toLowerCase()))) {
+      throw new AuthForbiddenError('Token email is not authorized to access this MCP server.');
+    }
+
+    if (config.requiredScopes && config.requiredScopes.length > 0) {
+      const scopeSet = new Set(scopes);
+      const missing = config.requiredScopes.filter((s) => !scopeSet.has(s));
+      if (missing.length > 0) {
+        throw new AuthInsufficientScopeError(
+          `Missing required scope(s): ${missing.join(', ')}`,
+        );
+      }
+    }
+
+    return { mode, subject, email, scopes, claims };
+  }
+
+  async function verifyOpaqueToken(token: string): Promise<VerifiedAuth> {
+    if (!tokenInfoUri) {
+      throw new Error('Token is not a JWT and no opaque tokeninfo endpoint is configured.');
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const cached = opaqueCache.get(tokenHash);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now) {
+      return cached.auth;
+    }
+
+    const body = new URLSearchParams({ access_token: token });
+    const res = await fetch(tokenInfoUri, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        accept: 'application/json',
+      },
+      body: body.toString(),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Token introspection rejected the access token (${res.status}).`);
+    }
+
+    const info = (await res.json()) as Record<string, unknown>;
+
+    if (config.oauthAudience) {
+      const aud = typeof info.aud === 'string' ? info.aud : undefined;
+      const azp = typeof info.azp === 'string' ? info.azp : undefined;
+      if (aud !== config.oauthAudience && azp !== config.oauthAudience) {
+        throw new Error('Access token audience does not match OAUTH_AUDIENCE.');
+      }
+    }
+
+    if (info.email && info.email_verified !== undefined) {
+      const verified = info.email_verified === true || info.email_verified === 'true';
+      if (!verified) {
+        throw new Error('Access token email is not verified.');
+      }
+    }
+
+    const expSec = typeof info.exp === 'string' ? Number(info.exp) : Number(info.exp ?? 0);
+    if (expSec > 0 && expSec * 1000 <= now) {
+      throw new Error('Access token is expired.');
+    }
+
+    const subject = typeof info.sub === 'string' ? info.sub : undefined;
+    const email = typeof info.email === 'string' ? info.email : undefined;
+    const scopes = extractScopes(info);
+    const verified = enforcePolicy('oauth-opaque', subject, email, scopes, info);
+
+    const tokenExpMs = expSec > 0 ? expSec * 1000 : now + OPAQUE_CACHE_MAX_TTL_MS;
+    const cacheUntil = Math.min(tokenExpMs, now + OPAQUE_CACHE_MAX_TTL_MS);
+    opaqueCache.set(tokenHash, { auth: verified, expiresAt: cacheUntil });
+    return verified;
+  }
+
   return {
     async verify(token: string): Promise<VerifiedAuth> {
+      if (!isJwtFormat(token)) {
+        return verifyOpaqueToken(token);
+      }
+
       const jwks = await getJwks();
       const { payload } = await jwtVerify(token, jwks, {
         ...(config.oauthIssuer ? { issuer: config.oauthIssuer } : {}),
@@ -151,33 +264,8 @@ export function createJwtVerifier(config: AuthConfig): JwtVerifier {
 
       const subject = typeof payload.sub === 'string' ? payload.sub : undefined;
       const email = typeof payload.email === 'string' ? payload.email : undefined;
-
-      if (allowedSubs && (!subject || !allowedSubs.has(subject))) {
-        throw new AuthForbiddenError('Token subject is not authorized to access this MCP server.');
-      }
-
-      if (allowedEmails && (!email || !allowedEmails.has(email.toLowerCase()))) {
-        throw new AuthForbiddenError('Token email is not authorized to access this MCP server.');
-      }
-
-      const scopes = extractScopes(payload);
-      if (config.requiredScopes && config.requiredScopes.length > 0) {
-        const scopeSet = new Set(scopes);
-        const missing = config.requiredScopes.filter((s) => !scopeSet.has(s));
-        if (missing.length > 0) {
-          throw new AuthInsufficientScopeError(
-            `Missing required scope(s): ${missing.join(', ')}`,
-          );
-        }
-      }
-
-      return {
-        mode: 'oauth-jwt',
-        subject,
-        email,
-        scopes,
-        claims: payload,
-      };
+      const scopes = extractScopes(payload as Record<string, unknown>);
+      return enforcePolicy('oauth-jwt', subject, email, scopes, payload as Record<string, unknown>);
     },
   };
 }
@@ -199,12 +287,15 @@ class AuthInsufficientScopeError extends Error {
 /**
  * Express authentication middleware supporting:
  * 1. OAuth 2.0 / OIDC JWT verification via JWKS (`OAUTH_ISSUER` / `OAUTH_JWKS_URI`).
- * 2. Static Bearer token verification (`MCP_BEARER_TOKEN`) as an optional fallback.
+ * 2. Opaque OAuth 2.0 access tokens (e.g., Google Cloud OAuth `ya29.*` tokens via tokeninfo).
+ * 3. Static Bearer token verification (`MCP_BEARER_TOKEN`) as an optional fallback.
  */
 export function createAuthMiddleware(config: AuthConfig) {
-  const oauthEnabled = Boolean(config.oauthIssuer || config.oauthJwksUri);
+  const oauthEnabled = Boolean(
+    config.oauthIssuer || config.oauthJwksUri || config.oauthTokenInfoUri,
+  );
   const staticEnabled = Boolean(config.bearerToken);
-  const jwtVerifier = oauthEnabled ? createJwtVerifier(config) : undefined;
+  const verifier = oauthEnabled ? createJwtVerifier(config) : undefined;
 
   return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
     if (!oauthEnabled && !staticEnabled) {
@@ -225,16 +316,15 @@ export function createAuthMiddleware(config: AuthConfig) {
 
     const token = match[1];
 
-    // Optional static Bearer token check (useful for CI/health scripts alongside OAuth).
     if (staticEnabled && config.bearerToken && constantTimeEquals(token, config.bearerToken)) {
       req.auth = { mode: 'static-bearer', scopes: [] };
       next();
       return;
     }
 
-    if (jwtVerifier) {
+    if (verifier) {
       try {
-        req.auth = await jwtVerifier.verify(token);
+        req.auth = await verifier.verify(token);
         next();
         return;
       } catch (err) {
@@ -263,7 +353,7 @@ export function createAuthMiddleware(config: AuthConfig) {
         );
         res.status(401).json({
           error: 'invalid_token',
-          message: 'Bearer JWT verification failed.',
+          message: 'Bearer token verification failed.',
         });
         return;
       }
