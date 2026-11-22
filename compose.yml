@@ -1,0 +1,22 @@
+services:
+  docker-sandbox-mcp:
+    build: .
+    container_name: docker-sandbox-mcp
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: 8080
+      MCP_TRANSPORT: http
+    # Expose via GoDoxy (https://github.com/yusing/godoxy)
+    # Accessible at https://<proxy.aliases>.<your-domain>/mcp
+    labels:
+      proxy.aliases: sbx-mcp
+      proxy.#1.port: 8080
+      # Optional: let GoDoxy pause the container when idle and wake on traffic
+      # proxy.#1.idle_timeout: 10m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
